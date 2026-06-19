@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react'
 
-const STORAGE_KEY = 'project_takeover_radar_v2'
+const STORAGE_KEY = 'project_takeover_radar_v31'
 
 const MARKET_DEFS = {
   XAUUSD: { name: 'Gold', type: 'metal', finnhub: 'OANDA:XAU_USD', twelve: 'XAU/USD', proxy: 'XAUUSD' },
@@ -11,7 +11,7 @@ const MARKET_DEFS = {
   USDJPY: { name: 'USD / Yen', type: 'fx', finnhub: 'OANDA:USD_JPY', twelve: 'USD/JPY', proxy: 'USDJPY' },
 }
 const MARKET_LIST = Object.keys(MARKET_DEFS)
-const SETUP_STATES = ['NO SETUP','WATCHING','FORMING','READY','TRIGGERED','MANAGING','INVALIDATED','CLOSED']
+const SETUP_STATES = ['NO DATA','NO SETUP','TOO FAR','WATCH','FORMING','READY','TRIGGERED','MANAGING','TARGET HIT','INVALIDATED','CLOSED']
 const GRADES = ['A+','A','B','C','REJECT']
 const MISTAKES = ['None','Variance','Execution mistake','Emotional mistake','Strategy mistake','Missed trade','Good skip','Entered too early','Chased entry','Oversized risk','No HTF displacement','News blindside']
 const SESSIONS = ['Asia','London','NY AM','NY PM','Overlap']
@@ -29,6 +29,10 @@ function fmt(v, d=2){ const x=n(v); return x===null ? '—' : x.toLocaleString(u
 function pct(v){ const x=n(v); return x===null ? '—' : `${x.toFixed(2)}%` }
 function clamp(v,a,b){ return Math.max(a, Math.min(b, v)) }
 function directionSign(direction){ return direction === 'LONG' ? 1 : direction === 'SHORT' ? -1 : 0 }
+function livePrice(v){ const x = n(v); return x !== null && x > 0 ? x : null }
+function statusTone(status){ return status === 'READY' ? 'green' : status === 'TARGET HIT' || status === 'MANAGING' || status === 'WATCH' || status === 'FORMING' ? 'amber' : status === 'INVALIDATED' ? 'red' : 'neutral' }
+function hasZone(z){ return [z?.watchLow,z?.watchHigh,z?.entryLow,z?.entryHigh,z?.invalidation,z?.tp1].some(v => n(v) !== null) }
+function formatTime(v){ if(!v) return '—'; try { return new Date(v).toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' }) } catch { return '—' } }
 
 function defaultZones(){
   return MARKET_LIST.reduce((acc, sym) => {
@@ -41,13 +45,8 @@ function defaultScreens(){ return MARKET_LIST.reduce((acc, sym)=>{ acc[sym] = (T
 function seedState(){
   const zones = defaultZones()
   zones.XAUUSD = { watchLow:'2321', watchHigh:'2334', entryLow:'2327.5', entryHigh:'2329.5', invalidation:'2321.8', tp1:'2340', tp2:'2358', tp3:'2380', direction:'LONG', htfBias:'bullish', setupType:'HTF sweep + displacement', requiredConfirmation:'1H displacement + 15M retest' }
-  const setups = [
-    { id:'S-001', market:'XAUUSD', direction:'LONG', status:'READY', grade:'A', riskPct:0.5, entry:'2328.50', sl:'2321.80', tp1:'2340', tp2:'2358', tp3:'2380', reason:'HTF bullish + price inside entry zone + clean upside route.', missing:'Final chart check only.', invalidation:'1H close below 2321.80', nextAction:'Verify chart. Place limit only, no chase.', createdAt:new Date().toISOString(), taken:false },
-    { id:'S-002', market:'EURUSD', direction:'SHORT', status:'FORMING', grade:'B', riskPct:0.25, entry:'', sl:'', tp1:'', tp2:'', tp3:'', reason:'London liquidity is being built above current price.', missing:'Sweep + 1H displacement.', invalidation:'D1 bias flips bullish.', nextAction:'Watch only. No entry.', createdAt:new Date().toISOString(), taken:false },
-  ]
-  const trades = [
-    { id:'T-001', setupId:'S-001', market:'XAUUSD', direction:'LONG', status:'MANAGING', entry:'2328.50', sl:'2321.80', tp1:'2340', tp2:'2358', tp3:'2380', riskPct:0.5, openedAt:new Date().toISOString(), closedAt:'', result:'open', r:0, notes:'Seed example.' }
-  ]
+  const setups = []
+  const trades = []
   const journal = [
     { id:'J-001', market:'NQ', date:new Date(Date.now()-86400000).toISOString(), session:'NY AM', setupType:'OR breakout', decision:'WAIT', taken:true, result:'loss', r:-1, classification:'Execution mistake', mistake:'Entered too early', emotion:'FOMO', lesson:'Require HTF displacement before A rating.' },
     { id:'J-002', market:'ES', date:new Date(Date.now()-4*86400000).toISOString(), session:'NY AM', setupType:'Reversal', decision:'WAIT', taken:true, result:'loss', r:-1, classification:'Execution mistake', mistake:'Entered too early', emotion:'FOMO', lesson:'Same early-entry pattern.' },
@@ -61,27 +60,62 @@ function seedState(){
     rules:['Never risk more than 1% on a single trade.','Live price can only trigger WATCH / READY / INVALID — never TAKE.','No A+ without HTF bias + liquidity + displacement + valid RR.','Two losses in one day: stop or reduce to 0.25%.','One normal loss is variance, not a strategy change.']
   }
 }
-function loadState(){ try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || seedState() } catch { return seedState() } }
+
+function sanitizeState(raw){
+  const base = seedState()
+  const s = raw && typeof raw === 'object' ? { ...base, ...raw } : base
+  s.settings = { ...base.settings, ...(raw?.settings || {}) }
+  s.zones = { ...defaultZones(), ...(raw?.zones || {}) }
+  s.prices = { ...defaultPrices(), ...(raw?.prices || {}) }
+  for (const sym of MARKET_LIST) {
+    const x = livePrice(s.prices[sym]?.price)
+    s.prices[sym] = { ...defaultPrices()[sym], ...(s.prices[sym] || {}), price: x }
+    if (!x && s.prices[sym].status !== 'error') s.prices[sym].status = s.prices[sym].source || 'manual'
+  }
+  s.setups = Array.isArray(raw?.setups) ? raw.setups.filter(x => x && x.market && x.id) : []
+  s.trades = Array.isArray(raw?.trades) ? raw.trades.filter(x => x && x.market && x.id && x.notes !== 'Seed example.' && livePrice(s.prices[x.market]?.price) !== null) : []
+  s.journal = Array.isArray(raw?.journal) ? raw.journal : base.journal
+  s.screens = { ...defaultScreens(), ...(raw?.screens || {}) }
+  s.daily = { ...base.daily, ...(raw?.daily || {}) }
+  s.rules = Array.isArray(raw?.rules) ? raw.rules : base.rules
+  return s
+}
+function loadState(){
+  try { return sanitizeState(JSON.parse(localStorage.getItem(STORAGE_KEY))) }
+  catch { return seedState() }
+}
+
 
 function setupFromZone(sym, zone, priceObj){
-  const price = n(priceObj?.price)
+  const price = livePrice(priceObj?.price)
   const z = zone || {}
   const wl=n(z.watchLow), wh=n(z.watchHigh), el=n(z.entryLow), eh=n(z.entryHigh), inv=n(z.invalidation)
   const tps=[n(z.tp1),n(z.tp2),n(z.tp3)]
-  let status = 'NO SETUP', reason = 'No active zone configured.', next = 'Set watch zone and entry zone.', missing = 'Watch zone', grade='REJECT'
-  if(price !== null && wl !== null && wh !== null && price >= Math.min(wl,wh) && price <= Math.max(wl,wh)) { status='WATCHING'; reason='Price entered watch zone.'; next='Wait for confirmation. No market entry.'; missing=z.requiredConfirmation || 'confirmation'; grade='C' }
-  if(price !== null && el !== null && eh !== null && price >= Math.min(el,eh) && price <= Math.max(el,eh)) { status='READY'; reason='Price is inside entry zone.'; next='Run Decision Engine before execution.'; missing='Decision Engine confirmation'; grade = z.htfBias && z.htfBias !== 'neutral' ? 'A' : 'B' }
-  if(price !== null && inv !== null) {
+  const configured = hasZone(z)
+  if(!configured) return { status:'NO SETUP', reason:'No active watch zone configured.', next:'Set watch zone, entry zone and invalidation.', missing:'Watch zone', grade:'REJECT', distance:null }
+  if(price === null) return { status:'NO DATA', reason:'Waiting for live or manual price.', next:'Add manual price or connect Finnhub/Twelve Data.', missing:'Price feed', grade:'REJECT', distance:null }
+
+  let status = 'TOO FAR', reason = 'Price is outside all active zones.', next = 'Wait. No trade until price reaches the watch zone.', missing = 'Price near zone', grade='C'
+  const watchDistance = distanceToZone(price, z.watchLow, z.watchHigh)
+  const entryDistance = distanceToZone(price, z.entryLow, z.entryHigh)
+
+  if(wl !== null && wh !== null && price >= Math.min(wl,wh) && price <= Math.max(wl,wh)) {
+    status='WATCH'; reason='Price entered watch zone.'; next='Wait for confirmation. No market entry.'; missing=z.requiredConfirmation || 'confirmation'; grade='C'
+  }
+  if(el !== null && eh !== null && price >= Math.min(el,eh) && price <= Math.max(el,eh)) {
+    status='READY'; reason='Price is inside entry zone.'; next='Run Decision Engine before execution.'; missing='Decision Engine confirmation'; grade = z.htfBias && z.htfBias !== 'neutral' ? 'A' : 'B'
+  }
+  if(inv !== null) {
     if(z.direction === 'LONG' && price <= inv) { status='INVALIDATED'; reason='Price hit invalidation.'; next='No trade. Archive setup.'; missing='—'; grade='REJECT' }
     if(z.direction === 'SHORT' && price >= inv) { status='INVALIDATED'; reason='Price hit invalidation.'; next='No trade. Archive setup.'; missing='—'; grade='REJECT' }
   }
-  const tpHit = price !== null && tps.findIndex(tp => tp !== null && ((z.direction==='LONG' && price>=tp) || (z.direction==='SHORT' && price<=tp)))
-  if(tpHit >= 0){ status='MANAGING'; reason=`TP${tpHit+1} reached or passed.`; next='Manage position according to plan.'; missing='management' }
-  return { status, reason, next, missing, grade }
+  const tpIndex = tps.findIndex(tp => tp !== null && ((z.direction==='LONG' && price>=tp) || (z.direction==='SHORT' && price<=tp)))
+  if(tpIndex >= 0){ status='TARGET HIT'; reason=`TP${tpIndex+1} reached or passed.`; next='Manage position according to plan.'; missing='management'; grade='A' }
+  return { status, reason, next, missing, grade, distance: entryDistance ?? watchDistance }
 }
 function distanceToZone(price, low, high){ const p=n(price), l=n(low), h=n(high); if(p===null||l===null||h===null) return null; if(p>=Math.min(l,h)&&p<=Math.max(l,h)) return 0; return p<Math.min(l,h) ? Math.min(l,h)-p : p-Math.max(l,h) }
 function computeFloatingR(trade, price){
-  const p=n(price), e=n(trade.entry), sl=n(trade.sl); if(p===null||e===null||sl===null||e===sl) return null
+  const p=livePrice(price), e=n(trade.entry), sl=n(trade.sl); if(p===null||e===null||sl===null||e===sl) return null
   const sign = directionSign(trade.direction); return ((p-e)*sign / Math.abs(e-sl))
 }
 function riskCalc({accountSize,riskPct,entry,sl,tp1,market}){
@@ -138,10 +172,10 @@ function App(){
   const liveStatuses = useMemo(()=>MARKET_LIST.reduce((acc,sym)=>{ acc[sym]=setupFromZone(sym,state.zones[sym],state.prices[sym]); return acc },{}),[state.zones,state.prices])
   const activeTrades = state.trades.filter(t=>!['CLOSED','INVALIDATED'].includes(t.status))
   const rankedMarkets = MARKET_LIST.map(sym=>{
-    const st = liveStatuses[sym]; const base = st.status==='READY'?90:st.status==='MANAGING'?84:st.status==='FORMING'?72:st.status==='WATCHING'?62:st.status==='INVALIDATED'?0:35
-    return { sym, ...st, score:base, price:state.prices[sym]?.price }
+    const st = liveStatuses[sym]; const base = st.status==='READY'?92:st.status==='TARGET HIT'?88:st.status==='MANAGING'?84:st.status==='FORMING'?72:st.status==='WATCH'?64:st.status==='TOO FAR'?42:st.status==='NO DATA'?30:st.status==='INVALIDATED'?0:25
+    return { sym, ...st, score:base, price:state.prices[sym]?.price, priceObj:state.prices[sym] }
   }).sort((a,b)=>b.score-a.score)
-  const primary = rankedMarkets.find(m=>['READY','MANAGING','WATCHING','FORMING'].includes(m.status)) || rankedMarkets[0]
+  const primary = rankedMarkets.find(m=>['READY','TARGET HIT','MANAGING','WATCH','FORMING'].includes(m.status)) || rankedMarkets.find(m=>m.status==='NO DATA' && hasZone(state.zones[m.sym])) || rankedMarkets.find(m=>m.sym===state.daily.primary) || rankedMarkets[0]
 
   async function refreshPrices(){
     const provider = state.settings.dataProvider
@@ -161,7 +195,7 @@ function App(){
 
   function createSetup(sym){
     const z = state.zones[sym]; const st = liveStatuses[sym];
-    const setup = { id:id('S'), market:sym, direction:z.direction, status:st.status==='NO SETUP'?'WATCHING':st.status, grade:st.grade, riskPct:st.grade==='A'?0.5:0.25, entry:z.entryLow || '', sl:z.invalidation || '', tp1:z.tp1||'', tp2:z.tp2||'', tp3:z.tp3||'', reason:st.reason, missing:st.missing, invalidation:z.invalidation?`${z.direction==='LONG'?'Below':'Above'} ${z.invalidation}`:'Not defined', nextAction:st.next, createdAt:new Date().toISOString(), taken:false }
+    const setup = { id:id('S'), market:sym, direction:z.direction, status:['NO SETUP','NO DATA','TOO FAR'].includes(st.status)?'WATCH':st.status, grade:st.grade, riskPct:st.grade==='A'?0.5:0.25, entry:z.entryLow || '', sl:z.invalidation || '', tp1:z.tp1||'', tp2:z.tp2||'', tp3:z.tp3||'', reason:st.reason, missing:st.missing, invalidation:z.invalidation?`${z.direction==='LONG'?'Below':'Above'} ${z.invalidation}`:'Not defined', nextAction:st.next, createdAt:new Date().toISOString(), taken:false }
     update(s=>{ s.setups.unshift(setup); return s })
     setPage('radar')
   }
@@ -170,13 +204,15 @@ function App(){
     update(s=>{ const x=s.setups.find(a=>a.id===setup.id); if(x){x.taken=true;x.status='TRIGGERED'} s.trades.unshift(trade); return s })
   }
   function closeTrade(trade, result){
-    const currentR = computeFloatingR(trade, state.prices[trade.market]?.price) || 0
-    update(s=>{ const t=s.trades.find(x=>x.id===trade.id); if(t){t.status='CLOSED';t.result=result;t.r=Number(currentR.toFixed(2));t.closedAt=new Date().toISOString()} s.journal.unshift({ id:id('J'), market:trade.market, date:new Date().toISOString(), session:'Manual', setupType:'Radar setup', decision:'TAKE', taken:true, result, r:Number(currentR.toFixed(2)), classification: result==='loss'?'Variance':'Good skip', mistake:'None', emotion:'Calm', lesson:'' }); return s })
+    const currentR = computeFloatingR(trade, state.prices[trade.market]?.price)
+    const finalR = currentR === null ? 0 : Number(currentR.toFixed(2))
+    update(s=>{ const t=s.trades.find(x=>x.id===trade.id); if(t){t.status='CLOSED';t.result=result;t.r=finalR;t.closedAt=new Date().toISOString()} s.journal.unshift({ id:id('J'), market:trade.market, date:new Date().toISOString(), session:'Manual', setupType:'Radar setup', decision:'TAKE', taken:true, result, r:finalR, classification: result==='loss'?'Variance':'Good skip', mistake:'None', emotion:'Calm', lesson: currentR === null ? 'Closed without live price feed; verify result manually.' : '' }); return s })
   }
-  const pages = { radar:'Radar', scanner:'Scanner', decide:'Decide', risk:'Risk', trades:'Trades', journal:'Journal', learning:'Learning', daily:'Daily', weekly:'CEO Review', settings:'Settings' }
+  const pages = { radar:'Radar', scanner:'Scanner', live:'Live Watcher', decide:'Decide', risk:'Risk', trades:'Trades', journal:'Journal', learning:'Learning', daily:'Daily', weekly:'CEO Review', settings:'Settings' }
   const render = {
     radar:<Radar state={state} primary={primary} rankedMarkets={rankedMarkets} activeTrades={activeTrades} liveStatuses={liveStatuses} setPage={setPage} setSelected={setSelected} createSetup={createSetup} markTaken={markTaken} gov={gov} closeTrade={closeTrade}/>,
     scanner:<Scanner state={state} update={update} rankedMarkets={rankedMarkets} liveStatuses={liveStatuses} refreshPrices={refreshPrices} setSelected={setSelected} setPage={setPage} manualPrice={manualPrice} setManualPrice={setManualPrice}/>,
+    live:<LiveWatcher state={state} rankedMarkets={rankedMarkets} refreshPrices={refreshPrices} setPage={setPage} setSelected={setSelected}/>,
     decide:<Decide state={state} update={update} selected={selected} setSelected={setSelected} createSetup={createSetup}/>,
     risk:<Risk state={state}/>,
     trades:<Trades state={state} update={update} closeTrade={closeTrade}/>,
@@ -189,7 +225,7 @@ function App(){
   return <div className="app">
     <aside className="side"><Logo/><nav>{Object.entries(pages).map(([k,v])=><button key={k} className={page===k?'active':''} onClick={()=>setPage(k)}>{v}</button>)}</nav></aside>
     <main className="main"><MobileTop page={pages[page]}/>{render[page]}</main>
-    <nav className="bottom">{['radar','scanner','decide','trades','settings'].map(k=><button key={k} className={page===k?'active':''} onClick={()=>setPage(k)}>{pages[k]}</button>)}</nav>
+    <nav className="bottom">{['radar','scanner','live','trades','settings'].map(k=><button key={k} className={page===k?'active':''} onClick={()=>setPage(k)}>{pages[k]}</button>)}</nav>
   </div>
 }
 function Logo(){ return <div className="logo"><div className="logoMark">PT</div><div><b>PROJECT TAKEOVER</b><span>SETUP RADAR</span></div></div> }
@@ -197,37 +233,56 @@ function MobileTop({page}){ return <div className="mobileTop"><Logo/><Badge tone
 function Header({kicker,title,sub}){ return <header className="head"><p>{kicker}</p><h1>{title}</h1>{sub&&<span>{sub}</span>}</header> }
 
 function Radar({state, primary, rankedMarkets, activeTrades, liveStatuses, setPage, setSelected, createSetup, markTaken, gov, closeTrade}){
-  const setupsNow = state.setups.filter(s=>['READY','TRIGGERED'].includes(s.status) && !s.taken)
-  const setupsLater = state.setups.filter(s=>['WATCHING','FORMING'].includes(s.status) && !s.taken)
+  const setupsNow = state.setups.filter(s=>['READY','TRIGGERED','TARGET HIT'].includes(s.status) && !s.taken)
+  const setupsLater = state.setups.filter(s=>['WATCH','WATCHING','FORMING','TOO FAR'].includes(s.status) && !s.taken)
+  const invalidated = state.setups.filter(s=>s.status==='INVALIDATED' && !s.taken)
+  const readyCount = rankedMarkets.filter(m=>m.status==='READY').length
+  const watchCount = rankedMarkets.filter(m=>['WATCH','FORMING'].includes(m.status)).length
+  const invalidCount = rankedMarkets.filter(m=>m.status==='INVALIDATED').length
   return <>
     <Header kicker="Setup Radar" title="Today’s command" sub="Live prices create WATCH / READY / INVALID. The Decision Engine still decides TAKE / WAIT / SKIP."/>
     <Card className="command">
-      <div><span className="muted">PRIMARY MARKET</span><h2>{primary.sym}</h2><p>{MARKET_DEFS[primary.sym].name} · price {fmt(primary.price, primary.sym.includes('JPY')?3:2)}</p></div>
-      <div className="verdict"><Badge tone={primary.status==='READY'?'green':primary.status==='INVALIDATED'?'red':'amber'}>{primary.status}</Badge><strong>{primary.grade}</strong></div>
+      <div><span className="muted">PRIMARY MARKET</span><h2>{primary.sym}</h2><p>{MARKET_DEFS[primary.sym].name} · price {fmt(livePrice(primary.price), primary.sym.includes('JPY')?3:2)} · updated {formatTime(primary.priceObj?.updated)}</p></div>
+      <div className="verdict"><Badge tone={statusTone(primary.status)}>{primary.status}</Badge><strong>{primary.grade}</strong></div>
       <div className="reason"><b>{primary.reason}</b><span>{primary.next}</span></div>
-      <div className="actions"><Button onClick={()=>{setSelected(primary.sym); setPage('decide')}}>Run Decision</Button><Button tone="steel" onClick={()=>createSetup(primary.sym)}>Save Setup</Button></div>
+      <div className="actions"><Button onClick={()=>{setSelected(primary.sym); setPage('decide')}}>Run Decision</Button><Button tone="steel" onClick={()=>{setSelected(primary.sym); setPage('scanner')}}>Edit Zone</Button><Button tone="steel" onClick={()=>createSetup(primary.sym)}>Save Setup</Button></div>
     </Card>
+    <div className="stats mini"><Card><span>READY NOW</span><b className="greenText">{readyCount}</b></Card><Card><span>WATCHING</span><b>{watchCount}</b></Card><Card><span>ACTIVE</span><b>{activeTrades.length}</b></Card><Card><span>INVALID</span><b className="redText">{invalidCount}</b></Card></div>
     <div className={`banner ${gov.state.toLowerCase()}`}>{gov.state}: {gov.msg}</div>
     <section className="split">
-      <div><h3>Setups now</h3>{setupsNow.length?setupsNow.map(s=><SetupCard key={s.id} setup={s} markTaken={markTaken}/>):<Empty text="No READY setups. Good. No forcing."/>}</div>
+      <div><h3>Ready now</h3>{setupsNow.length?setupsNow.map(s=><SetupCard key={s.id} setup={s} markTaken={markTaken}/>):<Empty text="No READY setups. Good. No forcing."/>}</div>
       <div><h3>Setups later</h3>{setupsLater.length?setupsLater.map(s=><SetupCard key={s.id} setup={s} markTaken={markTaken}/>):<Empty text="No forming setups."/>}</div>
     </section>
     <section><h3>Active trades</h3>{activeTrades.length?activeTrades.map(t=><TradeMonitor key={t.id} trade={t} price={state.prices[t.market]?.price} closeTrade={closeTrade}/>):<Empty text="No active trades."/>}</section>
-    <section><h3>Market ranking</h3><div className="rankGrid">{rankedMarkets.map(m=><button className="rank" key={m.sym} onClick={()=>{setSelected(m.sym);setPage('scanner')}}><span>{m.sym}</span><Badge tone={m.status==='READY'?'green':m.status==='INVALIDATED'?'red':m.status==='NO SETUP'?'neutral':'amber'}>{m.status}</Badge><b>{m.grade}</b><small>{m.reason}</small></button>)}</div></section>
+    <section><h3>Invalidated</h3>{invalidated.length?invalidated.map(s=><SetupCard key={s.id} setup={s} markTaken={markTaken}/>):<Empty text="No invalidated saved setups."/>}</section>
+    <section><h3>Market ranking</h3><div className="rankGrid">{rankedMarkets.map(m=><button className="rank" key={m.sym} onClick={()=>{setSelected(m.sym);setPage('scanner')}}><span>{m.sym}</span><Badge tone={statusTone(m.status)}>{m.status}</Badge><b>{m.grade}</b><small>{m.reason}</small><small>Distance: {m.distance === null || m.distance === undefined ? '—' : fmt(m.distance, m.sym==='USDJPY'?3:2)}</small></button>)}</div></section>
   </>
 }
-function SetupCard({setup, markTaken}){ return <Card className="setup"><div className="setupTop"><b>{setup.market} {setup.direction}</b><Badge tone={setup.status==='READY'?'green':'amber'}>{setup.status}</Badge></div><h4>{setup.grade} · risk {setup.riskPct}%</h4><p>{setup.reason}</p><dl><dt>Entry</dt><dd>{setup.entry||'—'}</dd><dt>SL</dt><dd>{setup.sl||'—'}</dd><dt>TP</dt><dd>{[setup.tp1,setup.tp2,setup.tp3].filter(Boolean).join(' / ')||'—'}</dd></dl><p className="muted">Missing: {setup.missing}</p><p className="muted">Invalidation: {setup.invalidation}</p><Button tone="green" onClick={()=>markTaken(setup)}>Mark taken</Button></Card> }
-function TradeMonitor({trade, price, closeTrade}){ const r=computeFloatingR(trade, price); return <Card className="trade"><div><b>{trade.market} {trade.direction}</b><span>Live {fmt(price)}</span></div><strong className={r>=0?'greenText':'redText'}>{r===null?'—':`${r.toFixed(2)}R`}</strong><p>Entry {trade.entry} · SL {trade.sl} · TP1 {trade.tp1}</p><div className="row"><Button tone="steel" onClick={()=>closeTrade(trade,'win')}>Close win</Button><Button tone="red" onClick={()=>closeTrade(trade,'loss')}>Close loss</Button></div></Card> }
+function SetupCard({setup, markTaken}){ return <Card className="setup"><div className="setupTop"><b>{setup.market} {setup.direction}</b><Badge tone={statusTone(setup.status)}>{setup.status}</Badge></div><h4>{setup.grade} · risk {setup.riskPct}%</h4><p>{setup.reason}</p><dl><dt>Entry</dt><dd>{setup.entry||'—'}</dd><dt>SL</dt><dd>{setup.sl||'—'}</dd><dt>TP</dt><dd>{[setup.tp1,setup.tp2,setup.tp3].filter(Boolean).join(' / ')||'—'}</dd></dl><p className="muted">Missing: {setup.missing}</p><p className="muted">Invalidation: {setup.invalidation}</p>{!setup.taken && setup.status !== 'INVALIDATED' && <Button tone="green" onClick={()=>markTaken(setup)}>Mark taken</Button>}</Card> }
+function TradeMonitor({trade, price, closeTrade}){
+  const live = livePrice(price)
+  const r=computeFloatingR(trade, live)
+  const tpDist = live === null || n(trade.tp1) === null ? null : Math.abs(n(trade.tp1)-live)
+  const slDist = live === null || n(trade.sl) === null ? null : Math.abs(live-n(trade.sl))
+  return <Card className="trade"><div><b>{trade.market} {trade.direction}</b><span>{live===null?'Waiting for price feed':`Live ${fmt(live)}`}</span></div><strong className={r===null?'':r>=0?'greenText':'redText'}>{r===null?'NO PRICE':`${r.toFixed(2)}R`}</strong><p>Entry {trade.entry} · SL {trade.sl} · TP1 {trade.tp1}</p><p className="muted">Distance to SL: {slDist===null?'—':fmt(slDist)} · Distance to TP1: {tpDist===null?'—':fmt(tpDist)}</p><div className="row"><Button tone="steel" onClick={()=>closeTrade(trade,'win')}>Close win</Button><Button tone="red" onClick={()=>closeTrade(trade,'loss')}>Close loss</Button></div></Card>
+}
 function Empty({text}){ return <Card className="empty">{text}</Card> }
 
+function LiveWatcher({state, rankedMarkets, refreshPrices, setPage, setSelected}){
+  return <><Header kicker="Live Watcher" title="Price feed + distance map" sub="This is the live market layer. If no API key is connected, use manual price in Scanner."/>
+    <Card><div className="row"><Button onClick={refreshPrices}>Refresh prices</Button><Button tone="steel" onClick={()=>setPage('settings')}>Provider settings</Button></div><p className="muted">Provider: {state.settings.dataProvider}. Poll: {state.settings.pollSeconds}s. API keys stored locally are not secret.</p></Card>
+    <div className="rankGrid liveGrid">{rankedMarkets.map(m=>{ const z=state.zones[m.sym], p=state.prices[m.sym]; const lp=livePrice(p.price); const dw=distanceToZone(lp,z.watchLow,z.watchHigh); const de=distanceToZone(lp,z.entryLow,z.entryHigh); return <button key={m.sym} className="rank" onClick={()=>{setSelected(m.sym);setPage('scanner')}}><span>{m.sym}</span><Badge tone={statusTone(m.status)}>{m.status}</Badge><b>{fmt(livePrice(p.price), m.sym==='USDJPY'?3:2)}</b><small>{MARKET_DEFS[m.sym].name} · {p.source} · {p.status}</small><small>Updated: {formatTime(p.updated)}</small><small>Watch distance: {dw===null?'—':fmt(dw, m.sym==='USDJPY'?3:2)}</small><small>Entry distance: {de===null?'—':fmt(de, m.sym==='USDJPY'?3:2)}</small>{p.error && <small className="redText">{p.error}</small>}</button> })}</div>
+  </>
+}
+
 function Scanner({state, update, rankedMarkets, liveStatuses, refreshPrices, setSelected, setPage, manualPrice, setManualPrice}){
-  return <><Header kicker="Live Pair Scanner" title="Scanner + watch zones" sub="Free APIs are optional. Manual mode always works."/><Card><div className="row"><Button onClick={refreshPrices}>Refresh live prices</Button><Button tone="steel" onClick={()=>setPage('settings')}>Data settings</Button></div></Card><div className="scanList">{MARKET_LIST.map(sym=><MarketRow key={sym} sym={sym} state={state} update={update} status={liveStatuses[sym]} setSelected={setSelected} setPage={setPage} manualPrice={manualPrice} setManualPrice={setManualPrice}/>)}</div></>
+  return <><Header kicker="Live Pair Scanner" title="Live scanner + watch zones" sub="Free APIs are optional. Manual mode always works."/><Card><div className="row"><Button onClick={refreshPrices}>Refresh live prices</Button><Button tone="steel" onClick={()=>setPage('settings')}>Data settings</Button></div></Card><div className="scanList">{MARKET_LIST.map(sym=><MarketRow key={sym} sym={sym} state={state} update={update} status={liveStatuses[sym]} setSelected={setSelected} setPage={setPage} manualPrice={manualPrice} setManualPrice={setManualPrice}/>)}</div></>
 }
 function MarketRow({sym,state,update,status,setSelected,setPage,manualPrice,setManualPrice}){
   const p=state.prices[sym], z=state.zones[sym]
   function updZone(k,v){ update(s=>{ s.zones[sym][k]=v; return s }) }
   function setPrice(){ const val=n(manualPrice); if(val!==null) update(s=>{ s.prices[sym]={price:val,source:'manual',status:'manual',updated:new Date().toISOString(),error:''}; return s }) }
-  return <Card className="marketRow"><div className="marketHead"><div><h3>{sym}</h3><p>{MARKET_DEFS[sym].name} · {MARKET_DEFS[sym].proxy}</p></div><div><Badge tone={status.status==='READY'?'green':status.status==='INVALIDATED'?'red':status.status==='NO SETUP'?'neutral':'amber'}>{status.status}</Badge><strong>{fmt(p.price, sym==='USDJPY'?3:2)}</strong></div></div><p>{status.reason} <span className="muted">Next: {status.next}</span></p><div className="zoneGrid"><Field label="Watch low"><TextInput value={z.watchLow} onChange={e=>updZone('watchLow',e.target.value)}/></Field><Field label="Watch high"><TextInput value={z.watchHigh} onChange={e=>updZone('watchHigh',e.target.value)}/></Field><Field label="Entry low"><TextInput value={z.entryLow} onChange={e=>updZone('entryLow',e.target.value)}/></Field><Field label="Entry high"><TextInput value={z.entryHigh} onChange={e=>updZone('entryHigh',e.target.value)}/></Field><Field label="Invalidation"><TextInput value={z.invalidation} onChange={e=>updZone('invalidation',e.target.value)}/></Field><Field label="TP1"><TextInput value={z.tp1} onChange={e=>updZone('tp1',e.target.value)}/></Field></div><div className="row"><Select value={z.direction} onChange={e=>updZone('direction',e.target.value)}><option>LONG</option><option>SHORT</option></Select><Select value={z.htfBias} onChange={e=>updZone('htfBias',e.target.value)}><option>bullish</option><option>neutral</option><option>bearish</option></Select><Button tone="steel" onClick={()=>{setSelected(sym);setPage('decide')}}>Decide</Button></div><div className="row"><TextInput placeholder="manual price" value={manualPrice} onChange={e=>setManualPrice(e.target.value)}/><Button tone="steel" onClick={setPrice}>Set price</Button></div><small className="muted">Source {p.source} · {p.status} · {p.error}</small></Card>
+  return <Card className="marketRow"><div className="marketHead"><div><h3>{sym}</h3><p>{MARKET_DEFS[sym].name} · {MARKET_DEFS[sym].proxy}</p></div><div><Badge tone={statusTone(status.status)}>{status.status}</Badge><strong>{fmt(livePrice(p.price), sym==='USDJPY'?3:2)}</strong></div></div><p>{status.reason} <span className="muted">Next: {status.next}</span></p><div className="zoneGrid"><Field label="Watch low"><TextInput value={z.watchLow} onChange={e=>updZone('watchLow',e.target.value)}/></Field><Field label="Watch high"><TextInput value={z.watchHigh} onChange={e=>updZone('watchHigh',e.target.value)}/></Field><Field label="Entry low"><TextInput value={z.entryLow} onChange={e=>updZone('entryLow',e.target.value)}/></Field><Field label="Entry high"><TextInput value={z.entryHigh} onChange={e=>updZone('entryHigh',e.target.value)}/></Field><Field label="Invalidation"><TextInput value={z.invalidation} onChange={e=>updZone('invalidation',e.target.value)}/></Field><Field label="TP1"><TextInput value={z.tp1} onChange={e=>updZone('tp1',e.target.value)}/></Field></div><div className="row"><Select value={z.direction} onChange={e=>updZone('direction',e.target.value)}><option>LONG</option><option>SHORT</option></Select><Select value={z.htfBias} onChange={e=>updZone('htfBias',e.target.value)}><option>bullish</option><option>neutral</option><option>bearish</option></Select><Button tone="steel" onClick={()=>{setSelected(sym);setPage('decide')}}>Decide</Button></div><div className="row"><TextInput placeholder="manual price" value={manualPrice} onChange={e=>setManualPrice(e.target.value)}/><Button tone="steel" onClick={setPrice}>Set price</Button></div><small className="muted">Source {p.source} · {p.status} · updated {formatTime(p.updated)} · {p.error}</small></Card>
 }
 function Decide({state,update,selected,setSelected,createSetup}){
   const [checks,setChecks]=useState({regime:false,macro:false,liquidity:false,structure:false,displacement:false,route:false,execution:false,rr:false,psych:true,news:true})
