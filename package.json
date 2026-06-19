@@ -1,9 +1,9 @@
 {
-  "name": "project-takeover-decision-engine",
+  "name": "project-takeover-action-desk",
   "private": true,
-  "version": "1.0.0",
+  "version": "4.0.0",
   "type": "module",
-  "description": "Project Takeover — Decision Engine. A research, decision, risk and journaling OS. Not a trading bot, no broker connection. Includes live/manual setup radar data layer.",
+  "description": "Project Takeover V4 Action Desk: manual TradingView setup planner, live/manual price radar, MT5 action flow, risk and journal OS. No auto execution.",
   "scripts": {
     "dev": "vite",
     "build": "vite build",

@@ -1,57 +1,35 @@
-# Project Takeover — Live Setup Radar V3.1
+# Project Takeover V4 — Action Desk
 
-Live setup radar for XAUUSD, NQ/QQQ proxy, ES/SPY proxy, EURUSD, GBPUSD and USDJPY.
+Manual trading desk for phone-first action.
 
-## What this version adds
+## What is new
 
-- New clean storage key so old browser data can no longer create fake NQ / price 0 states.
-- Removed seeded active trade and fake ready setups from a fresh install.
-- Fixed the fake `-347R` active-trade bug when no price feed is available.
-- Fixed false TP/target states when price is empty or zero.
-- Added explicit statuses: NO DATA, NO SETUP, TOO FAR, WATCH, READY, TARGET HIT, INVALIDATED.
-- Added Live Watcher page with price feed, source, update time, watch-zone distance and entry-zone distance.
-- Improved Radar homepage with Ready Now, Watching, Active and Invalid counters.
-- Improved Active Trade Monitor with Waiting for price feed, floating R, distance to SL and distance to TP1.
-- Scanner still supports manual price fallback plus Finnhub/Twelve Data provider settings.
+- Action Desk page: READY / WATCH / ACTIVE / INVALID overview
+- New Setup page: create a trade plan from TradingView
+- Mark trade as placed in MT5
+- Active Trades + Journal flow
+- Smart provider router option
+- Better price validation for XAUUSD / FX / proxy markets
+- Manual price input handles Dutch format like `2.325` for gold as `2325`
+- Provider errors become NO DATA instead of fake TP / TARGET HIT
 
-## Safety rules
+## Intended workflow
 
-- No broker execution.
-- No auto-trading.
-- No TradingView dependency.
-- Live price can only create WATCH / READY / INVALID / TARGET HIT status.
-- Final TAKE / WAIT / SKIP still requires the Decision Engine and user approval.
-- API keys stored in localStorage are not secret. For production, move API calls to Vercel serverless functions.
+TradingView = analysis.
+Project Takeover = setup plan, risk, action, tracking, journal.
+MT5 = manual execution for now.
 
-## Run locally
+## Run
 
 ```bash
 npm install
 npm run dev
 ```
 
-## Build
+## Deploy
 
-```bash
-npm run build
-```
+Push to GitHub. Vercel will build with `npm run build`.
 
-## Deploy existing Vercel project
+## Safety
 
-```bash
-git add .
-git commit -m "Live setup radar V3.1"
-git push
-```
-
-Vercel will redeploy automatically.
-
-## Free data providers
-
-Settings → Data provider:
-
-- Manual: always works.
-- Finnhub: add free Finnhub key.
-- Twelve Data: add free Twelve Data key.
-
-Free plans have rate limits and may not support every symbol. The app falls back to manual mode if a symbol fails.
+This app does not place broker orders. Verify every setup in TradingView/MT5. API keys stored in browser localStorage are not secret.

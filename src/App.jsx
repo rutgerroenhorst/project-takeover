@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react'
 
-const STORAGE_KEY = 'project_takeover_radar_v31'
+const STORAGE_KEY = 'project_takeover_action_desk_v4'
 
 const MARKET_DEFS = {
   XAUUSD: { name: 'Gold', type: 'metal', finnhub: 'OANDA:XAU_USD', twelve: 'XAU/USD', proxy: 'XAUUSD' },
@@ -24,13 +24,46 @@ const TF = {
 
 function todayISO(){ return new Date().toISOString().slice(0,10) }
 function id(prefix='S'){ return `${prefix}-${Math.random().toString(36).slice(2,6).toUpperCase()}` }
-function n(v){ const x = Number(v); return Number.isFinite(x) ? x : null }
+function n(v){
+  if (v === null || v === undefined || v === '') return null
+  const raw = String(v).trim().replace(/\s/g,'')
+  const normalized = raw.includes(',') && !raw.includes('.') ? raw.replace(',', '.') : raw
+  const x = Number(normalized)
+  return Number.isFinite(x) ? x : null
+}
+function normalizePriceInput(raw, sym){
+  if (raw === null || raw === undefined || raw === '') return null
+  if (typeof raw === 'number') return Number.isFinite(raw) ? raw : null
+  let s = String(raw).trim().replace(/\s/g,'')
+  // Dutch thousands for gold/index style: 2.325 => 2325, 2.325,80 => 2325.80
+  if (['XAUUSD','NQ','ES'].includes(sym)) {
+    if (/^\d{1,3}\.\d{3}$/.test(s)) s = s.replace('.', '')
+    else if (/^\d{1,3}\.\d{3},\d+$/.test(s)) s = s.replace(/\./g,'').replace(',', '.')
+    else if (/^\d+,\d+$/.test(s)) s = s.replace(',', '.')
+  } else {
+    // Forex: 1,1547 => 1.1547
+    s = s.replace(',', '.')
+  }
+  const x = Number(s)
+  return Number.isFinite(x) ? x : null
+}
+function isValidMarketPrice(sym, price){
+  const p = Number(price)
+  if (!Number.isFinite(p) || p <= 0) return false
+  if (sym === 'XAUUSD') return p >= 1000 && p <= 10000
+  if (sym === 'EURUSD' || sym === 'GBPUSD') return p >= 0.5 && p <= 2.5
+  if (sym === 'USDJPY') return p >= 50 && p <= 250
+  if (sym === 'NQ' || sym === 'ES') return p >= 50 && p <= 2000 // current free feed uses QQQ/SPY proxies
+  return true
+}
 function fmt(v, d=2){ const x=n(v); return x===null ? '—' : x.toLocaleString(undefined,{maximumFractionDigits:d}) }
+function priceDecimals(sym){ return sym === 'USDJPY' ? 3 : MARKET_DEFS[sym]?.type === 'fx' ? 5 : 2 }
+function displayPrice(sym, v){ const x=livePrice(v, sym); return x===null ? '—' : x.toLocaleString(undefined,{maximumFractionDigits:priceDecimals(sym)}) }
 function pct(v){ const x=n(v); return x===null ? '—' : `${x.toFixed(2)}%` }
 function clamp(v,a,b){ return Math.max(a, Math.min(b, v)) }
 function directionSign(direction){ return direction === 'LONG' ? 1 : direction === 'SHORT' ? -1 : 0 }
-function livePrice(v){ const x = n(v); return x !== null && x > 0 ? x : null }
-function statusTone(status){ return status === 'READY' ? 'green' : status === 'TARGET HIT' || status === 'MANAGING' || status === 'WATCH' || status === 'FORMING' ? 'amber' : status === 'INVALIDATED' ? 'red' : 'neutral' }
+function livePrice(v, sym=null){ const x = normalizePriceInput(v, sym || 'GENERIC'); if (x === null || x <= 0) return null; return sym ? (isValidMarketPrice(sym, x) ? x : null) : x }
+function statusTone(status){ return status === 'READY' ? 'green' : status === 'TARGET HIT' || status === 'TP1 HIT' || status === 'MANAGING' || status === 'WATCH' || status === 'FORMING' || status === 'WAITING' ? 'amber' : status === 'INVALIDATED' || status === 'SL HIT' || status === 'SKIPPED' ? 'red' : 'neutral' }
 function hasZone(z){ return [z?.watchLow,z?.watchHigh,z?.entryLow,z?.entryHigh,z?.invalidation,z?.tp1].some(v => n(v) !== null) }
 function formatTime(v){ if(!v) return '—'; try { return new Date(v).toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' }) } catch { return '—' } }
 
@@ -68,7 +101,7 @@ function sanitizeState(raw){
   s.zones = { ...defaultZones(), ...(raw?.zones || {}) }
   s.prices = { ...defaultPrices(), ...(raw?.prices || {}) }
   for (const sym of MARKET_LIST) {
-    const x = livePrice(s.prices[sym]?.price)
+    const x = livePrice(s.prices[sym]?.price, sym)
     s.prices[sym] = { ...defaultPrices()[sym], ...(s.prices[sym] || {}), price: x }
     if (!x && s.prices[sym].status !== 'error') s.prices[sym].status = s.prices[sym].source || 'manual'
   }
@@ -87,7 +120,7 @@ function loadState(){
 
 
 function setupFromZone(sym, zone, priceObj){
-  const price = livePrice(priceObj?.price)
+  const price = livePrice(priceObj?.price, sym)
   const z = zone || {}
   const wl=n(z.watchLow), wh=n(z.watchHigh), el=n(z.entryLow), eh=n(z.entryHigh), inv=n(z.invalidation)
   const tps=[n(z.tp1),n(z.tp2),n(z.tp3)]
@@ -115,7 +148,7 @@ function setupFromZone(sym, zone, priceObj){
 }
 function distanceToZone(price, low, high){ const p=n(price), l=n(low), h=n(high); if(p===null||l===null||h===null) return null; if(p>=Math.min(l,h)&&p<=Math.max(l,h)) return 0; return p<Math.min(l,h) ? Math.min(l,h)-p : p-Math.max(l,h) }
 function computeFloatingR(trade, price){
-  const p=livePrice(price), e=n(trade.entry), sl=n(trade.sl); if(p===null||e===null||sl===null||e===sl) return null
+  const p=livePrice(price, trade.market), e=n(trade.entry), sl=n(trade.sl); if(p===null||e===null||sl===null||e===sl) return null
   const sign = directionSign(trade.direction); return ((p-e)*sign / Math.abs(e-sl))
 }
 function riskCalc({accountSize,riskPct,entry,sl,tp1,market}){
@@ -138,20 +171,51 @@ function learning(journal){
   const counts={}; journal.forEach(j=>{ if(j.mistake && j.mistake !== 'None') counts[j.mistake]=(counts[j.mistake]||0)+1 })
   return Object.entries(counts).sort((a,b)=>b[1]-a[1]).map(([k,c])=>({ label:k, count:c, tier:c>=20?'rule candidate':c>=10?'strong hypothesis':c>=5?'hypothesis':c>=3?'pattern':'observation' }))
 }
+function providerForSymbol(provider, sym, settings){
+  if (provider === 'auto') {
+    return ['XAUUSD','EURUSD','GBPUSD','USDJPY'].includes(sym) ? 'twelve' : 'finnhub'
+  }
+  return provider
+}
 async function fetchPrice(provider, sym, settings){
   const def = MARKET_DEFS[sym]
-  if(provider === 'finnhub' && settings.finnhubKey){
+  const actual = providerForSymbol(provider, sym, settings)
+  if(actual === 'finnhub' && settings.finnhubKey){
     const url = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(def.finnhub)}&token=${encodeURIComponent(settings.finnhubKey)}`
-    const r = await fetch(url); const j = await r.json(); if(j.c) return { price:j.c, source:'Finnhub', status:'live', updated:new Date().toISOString(), error:'' }
-    throw new Error(j.error || 'Finnhub returned no price')
+    const r = await fetch(url); const j = await r.json();
+    const px = livePrice(j.c, sym)
+    if(px !== null) return { price:px, source:sym==='NQ'?'Finnhub QQQ proxy':sym==='ES'?'Finnhub SPY proxy':'Finnhub', status:'live', updated:new Date().toISOString(), error:'' }
+    throw new Error(j.error || `Finnhub returned invalid ${sym} price`)
   }
-  if(provider === 'twelve' && settings.twelveKey){
+  if(actual === 'twelve' && settings.twelveKey){
     const url = `https://api.twelvedata.com/price?symbol=${encodeURIComponent(def.twelve)}&apikey=${encodeURIComponent(settings.twelveKey)}`
-    const r = await fetch(url); const j = await r.json(); if(j.price) return { price:Number(j.price), source:'Twelve Data', status:'live', updated:new Date().toISOString(), error:'' }
-    throw new Error(j.message || 'Twelve Data returned no price')
+    const r = await fetch(url); const j = await r.json();
+    const px = livePrice(j.price, sym)
+    if(px !== null) return { price:px, source:'Twelve Data', status:'live', updated:new Date().toISOString(), error:'' }
+    throw new Error(j.message || j.code || `Twelve Data returned invalid ${sym} price`)
   }
-  throw new Error('Manual mode or missing API key')
+  throw new Error(actual === 'manual' ? 'Manual mode active' : `Missing ${actual} API key`)
 }
+
+function analyzePlannedSetup(setup, priceObj){
+  const price = livePrice(priceObj?.price, setup.market)
+  const e1 = n(setup.entry), e2 = n(setup.entryHigh || setup.entry), sl = n(setup.sl), tp1 = n(setup.tp1)
+  if (setup.status === 'SKIPPED' || setup.status === 'CLOSED') return { status:setup.status, reason:'Setup archived.', action:'No action.', distance:null }
+  if (setup.taken) return { status:'TAKEN', reason:'Trade was marked as placed in MT5.', action:'Manage under Active Trades.', distance:null }
+  if (price === null) return { status:'NO DATA', reason:'No usable live/manual price for this market.', action:'Set manual price or fix data provider.', distance:null }
+  if (e1 === null || sl === null) return { status:'WAITING', reason:'Entry or SL is missing.', action:'Complete the trade plan before action.', distance:null }
+  const lo = Math.min(e1, e2 ?? e1), hi = Math.max(e1, e2 ?? e1)
+  const sign = directionSign(setup.direction)
+  if (sl !== null && ((setup.direction==='LONG' && price <= sl) || (setup.direction==='SHORT' && price >= sl))) return { status:'INVALIDATED', reason:'Price hit the invalidation / SL level before entry.', action:'Do not take. Archive or rebuild plan.', distance:0 }
+  if (tp1 !== null && ((setup.direction==='LONG' && price >= tp1) || (setup.direction==='SHORT' && price <= tp1))) return { status:'TARGET HIT', reason:'Price already reached TP1 before you marked it taken.', action:'Do not chase. Plan is late.', distance:0 }
+  if (price >= lo && price <= hi) return { status:'READY', reason:'Price is inside the entry zone.', action:'Open TradingView for final check, then place trade in MT5 if still valid.', distance:0 }
+  const dist = price < lo ? lo-price : price-hi
+  const stop = Math.abs((e1 || 0) - (sl || 0))
+  const near = stop ? dist <= stop * 1.5 : false
+  if (near) return { status:'WATCH', reason:'Price is approaching the entry zone.', action:'Get ready. No entry until price hits the zone and chart still confirms.', distance:dist }
+  return { status:'TOO FAR', reason:'Price is far from the entry zone.', action:'Do nothing. Let price come to your plan.', distance:dist }
+}
+
 
 function Badge({children, tone='neutral'}){ return <span className={`badge ${tone}`}>{children}</span> }
 function Button({children, tone='primary', ...props}){ return <button className={`btn ${tone}`} {...props}>{children}</button> }
@@ -182,7 +246,7 @@ function App(){
     if(provider === 'manual') return
     for(const sym of MARKET_LIST){
       try{ const p = await fetchPrice(provider, sym, state.settings); update(s=>{ s.prices[sym]=p; return s }) }
-      catch(e){ update(s=>{ s.prices[sym] = { ...s.prices[sym], source:provider, status:'error', updated:new Date().toISOString(), error:e.message }; return s }) }
+      catch(e){ update(s=>{ s.prices[sym] = { price:null, source:provider, status:'error', updated:new Date().toISOString(), error:e.message }; return s }) }
     }
   }
   useEffect(()=>{
@@ -199,6 +263,30 @@ function App(){
     update(s=>{ s.setups.unshift(setup); return s })
     setPage('radar')
   }
+  function saveManualSetup(plan){
+    const e1 = normalizePriceInput(plan.entry, plan.market)
+    const e2 = normalizePriceInput(plan.entryHigh || plan.entry, plan.market)
+    const sl = normalizePriceInput(plan.sl, plan.market)
+    const t1 = normalizePriceInput(plan.tp1, plan.market)
+    const setup = {
+      id:id('S'), market:plan.market, direction:plan.direction, status:'WAITING', grade:plan.grade || 'B',
+      riskPct:Number(plan.riskPct)||0.5, entry:(e1 ?? plan.entry), entryHigh:(e2 ?? plan.entryHigh ?? e1 ?? ''), sl:(sl ?? plan.sl),
+      tp1:(t1 ?? plan.tp1), tp2:(normalizePriceInput(plan.tp2, plan.market) ?? plan.tp2), tp3:(normalizePriceInput(plan.tp3, plan.market) ?? plan.tp3),
+      reason:plan.reason || 'Manual TradingView setup.', missing:plan.missing || 'Final TradingView confirmation',
+      invalidation:sl ? `${plan.direction==='LONG'?'Below':'Above'} ${sl}` : 'Not defined', nextAction:'Wait for price to enter the entry zone. Then final chart check and MT5 execution.',
+      checklist: plan.checklist || {}, createdAt:new Date().toISOString(), taken:false
+    }
+    update(s=>{
+      s.setups.unshift(setup)
+      s.zones[plan.market] = { ...s.zones[plan.market], direction:plan.direction, entryLow:String(setup.entry||''), entryHigh:String(setup.entryHigh||setup.entry||''), invalidation:String(setup.sl||''), tp1:String(setup.tp1||''), tp2:String(setup.tp2||''), tp3:String(setup.tp3||''), requiredConfirmation:setup.missing, setupType:setup.reason }
+      return s
+    })
+    setSelected(plan.market)
+    setPage('action')
+  }
+  function archiveSetup(setupId, status='SKIPPED'){
+    update(s=>{ const x=s.setups.find(a=>a.id===setupId); if(x){x.status=status; x.skippedAt=new Date().toISOString()} return s })
+  }
   function markTaken(setup){
     const trade = { id:id('T'), setupId:setup.id, market:setup.market, direction:setup.direction, status:'MANAGING', entry:setup.entry, sl:setup.sl, tp1:setup.tp1, tp2:setup.tp2, tp3:setup.tp3, riskPct:setup.riskPct, openedAt:new Date().toISOString(), closedAt:'', result:'open', r:0, notes:setup.reason }
     update(s=>{ const x=s.setups.find(a=>a.id===setup.id); if(x){x.taken=true;x.status='TRIGGERED'} s.trades.unshift(trade); return s })
@@ -208,9 +296,11 @@ function App(){
     const finalR = currentR === null ? 0 : Number(currentR.toFixed(2))
     update(s=>{ const t=s.trades.find(x=>x.id===trade.id); if(t){t.status='CLOSED';t.result=result;t.r=finalR;t.closedAt=new Date().toISOString()} s.journal.unshift({ id:id('J'), market:trade.market, date:new Date().toISOString(), session:'Manual', setupType:'Radar setup', decision:'TAKE', taken:true, result, r:finalR, classification: result==='loss'?'Variance':'Good skip', mistake:'None', emotion:'Calm', lesson: currentR === null ? 'Closed without live price feed; verify result manually.' : '' }); return s })
   }
-  const pages = { radar:'Radar', scanner:'Scanner', live:'Live Watcher', decide:'Decide', risk:'Risk', trades:'Trades', journal:'Journal', learning:'Learning', daily:'Daily', weekly:'CEO Review', settings:'Settings' }
+  const pages = { radar:'Radar', action:'Action Desk', newsetup:'New Setup', scanner:'Scanner', live:'Live Watcher', decide:'Decide', risk:'Risk', trades:'Trades', journal:'Journal', learning:'Learning', daily:'Daily', weekly:'CEO Review', settings:'Settings' }
   const render = {
     radar:<Radar state={state} primary={primary} rankedMarkets={rankedMarkets} activeTrades={activeTrades} liveStatuses={liveStatuses} setPage={setPage} setSelected={setSelected} createSetup={createSetup} markTaken={markTaken} gov={gov} closeTrade={closeTrade}/>,
+    action:<ActionDesk state={state} markTaken={markTaken} closeTrade={closeTrade} archiveSetup={archiveSetup} setPage={setPage}/>,
+    newsetup:<NewSetup state={state} saveManualSetup={saveManualSetup} setPage={setPage}/>,
     scanner:<Scanner state={state} update={update} rankedMarkets={rankedMarkets} liveStatuses={liveStatuses} refreshPrices={refreshPrices} setSelected={setSelected} setPage={setPage} manualPrice={manualPrice} setManualPrice={setManualPrice}/>,
     live:<LiveWatcher state={state} rankedMarkets={rankedMarkets} refreshPrices={refreshPrices} setPage={setPage} setSelected={setSelected}/>,
     decide:<Decide state={state} update={update} selected={selected} setSelected={setSelected} createSetup={createSetup}/>,
@@ -225,7 +315,7 @@ function App(){
   return <div className="app">
     <aside className="side"><Logo/><nav>{Object.entries(pages).map(([k,v])=><button key={k} className={page===k?'active':''} onClick={()=>setPage(k)}>{v}</button>)}</nav></aside>
     <main className="main"><MobileTop page={pages[page]}/>{render[page]}</main>
-    <nav className="bottom">{['radar','scanner','live','trades','settings'].map(k=><button key={k} className={page===k?'active':''} onClick={()=>setPage(k)}>{pages[k]}</button>)}</nav>
+    <nav className="bottom">{['radar','action','newsetup','trades','settings'].map(k=><button key={k} className={page===k?'active':''} onClick={()=>setPage(k)}>{pages[k]}</button>)}</nav>
   </div>
 }
 function Logo(){ return <div className="logo"><div className="logoMark">PT</div><div><b>PROJECT TAKEOVER</b><span>SETUP RADAR</span></div></div> }
@@ -281,8 +371,8 @@ function Scanner({state, update, rankedMarkets, liveStatuses, refreshPrices, set
 function MarketRow({sym,state,update,status,setSelected,setPage,manualPrice,setManualPrice}){
   const p=state.prices[sym], z=state.zones[sym]
   function updZone(k,v){ update(s=>{ s.zones[sym][k]=v; return s }) }
-  function setPrice(){ const val=n(manualPrice); if(val!==null) update(s=>{ s.prices[sym]={price:val,source:'manual',status:'manual',updated:new Date().toISOString(),error:''}; return s }) }
-  return <Card className="marketRow"><div className="marketHead"><div><h3>{sym}</h3><p>{MARKET_DEFS[sym].name} · {MARKET_DEFS[sym].proxy}</p></div><div><Badge tone={statusTone(status.status)}>{status.status}</Badge><strong>{fmt(livePrice(p.price), sym==='USDJPY'?3:2)}</strong></div></div><p>{status.reason} <span className="muted">Next: {status.next}</span></p><div className="zoneGrid"><Field label="Watch low"><TextInput value={z.watchLow} onChange={e=>updZone('watchLow',e.target.value)}/></Field><Field label="Watch high"><TextInput value={z.watchHigh} onChange={e=>updZone('watchHigh',e.target.value)}/></Field><Field label="Entry low"><TextInput value={z.entryLow} onChange={e=>updZone('entryLow',e.target.value)}/></Field><Field label="Entry high"><TextInput value={z.entryHigh} onChange={e=>updZone('entryHigh',e.target.value)}/></Field><Field label="Invalidation"><TextInput value={z.invalidation} onChange={e=>updZone('invalidation',e.target.value)}/></Field><Field label="TP1"><TextInput value={z.tp1} onChange={e=>updZone('tp1',e.target.value)}/></Field></div><div className="row"><Select value={z.direction} onChange={e=>updZone('direction',e.target.value)}><option>LONG</option><option>SHORT</option></Select><Select value={z.htfBias} onChange={e=>updZone('htfBias',e.target.value)}><option>bullish</option><option>neutral</option><option>bearish</option></Select><Button tone="steel" onClick={()=>{setSelected(sym);setPage('decide')}}>Decide</Button></div><div className="row"><TextInput placeholder="manual price" value={manualPrice} onChange={e=>setManualPrice(e.target.value)}/><Button tone="steel" onClick={setPrice}>Set price</Button></div><small className="muted">Source {p.source} · {p.status} · updated {formatTime(p.updated)} · {p.error}</small></Card>
+  function setPrice(){ const val=livePrice(manualPrice, sym); if(val!==null) update(s=>{ s.prices[sym]={price:val,source:'manual',status:'manual',updated:new Date().toISOString(),error:''}; return s }) }
+  return <Card className="marketRow"><div className="marketHead"><div><h3>{sym}</h3><p>{MARKET_DEFS[sym].name} · {MARKET_DEFS[sym].proxy}</p></div><div><Badge tone={statusTone(status.status)}>{status.status}</Badge><strong>{displayPrice(sym, p.price)}</strong></div></div><p>{status.reason} <span className="muted">Next: {status.next}</span></p><div className="zoneGrid"><Field label="Watch low"><TextInput value={z.watchLow} onChange={e=>updZone('watchLow',e.target.value)}/></Field><Field label="Watch high"><TextInput value={z.watchHigh} onChange={e=>updZone('watchHigh',e.target.value)}/></Field><Field label="Entry low"><TextInput value={z.entryLow} onChange={e=>updZone('entryLow',e.target.value)}/></Field><Field label="Entry high"><TextInput value={z.entryHigh} onChange={e=>updZone('entryHigh',e.target.value)}/></Field><Field label="Invalidation"><TextInput value={z.invalidation} onChange={e=>updZone('invalidation',e.target.value)}/></Field><Field label="TP1"><TextInput value={z.tp1} onChange={e=>updZone('tp1',e.target.value)}/></Field></div><div className="row"><Select value={z.direction} onChange={e=>updZone('direction',e.target.value)}><option>LONG</option><option>SHORT</option></Select><Select value={z.htfBias} onChange={e=>updZone('htfBias',e.target.value)}><option>bullish</option><option>neutral</option><option>bearish</option></Select><Button tone="steel" onClick={()=>{setSelected(sym);setPage('decide')}}>Decide</Button></div><div className="row"><TextInput placeholder="manual price" value={manualPrice} onChange={e=>setManualPrice(e.target.value)}/><Button tone="steel" onClick={setPrice}>Set price</Button></div><small className="muted">Source {p.source} · {p.status} · updated {formatTime(p.updated)} · {p.error}</small></Card>
 }
 function Decide({state,update,selected,setSelected,createSetup}){
   const [checks,setChecks]=useState({regime:false,macro:false,liquidity:false,structure:false,displacement:false,route:false,execution:false,rr:false,psych:true,news:true})
@@ -294,12 +384,44 @@ function Decide({state,update,selected,setSelected,createSetup}){
   function updScreen(i,k,v){ update(s=>{ s.screens[selected][i][k]=v; return s }) }
   return <><Header kicker="Decision Engine" title="Validate the setup" sub="Live price can prepare a setup. Only this gate can approve a trade."/><div className="selector">{MARKET_LIST.map(s=><button className={s===selected?'active':''} onClick={()=>setSelected(s)} key={s}>{s}</button>)}</div><Card className={`decision ${decision.includes('TAKE')?'take':decision==='WAIT'?'wait':'skip'}`}><span>FINAL DECISION</span><h2>{decision}</h2><p>{decision.includes('TAKE')?'Place limit order only. No chase.':decision==='WAIT'?'Wait for missing confirmation. Set alert.':'No trade. Protect capital.'}</p><div className="row"><Badge tone={decision.includes('TAKE')?'green':decision==='WAIT'?'amber':'red'}>{score}/100</Badge><Badge tone="gold">Risk {risk}%</Badge></div><p><b>Invalidation:</b> {z.invalidation || 'not defined'}</p><p><b>Next:</b> {decision.includes('TAKE')?'Verify chart and calculate risk.': 'Wait for 1H displacement + 15M retest.'}</p></Card><section className="split"><Card><h3>Confluence gates</h3>{Object.keys(checks).map(k=><label className="check" key={k}><input type="checkbox" checked={checks[k]} onChange={e=>setChecks({...checks,[k]:e.target.checked})}/><span>{k}</span></label>)}<Button onClick={()=>createSetup(selected)}>Create setup dossier</Button></Card><Card><h3>Screenshot workflow</h3>{screens.map((x,i)=><div className="tf" key={x.tf}><label><input type="checkbox" checked={x.checked} onChange={e=>updScreen(i,'checked',e.target.checked)}/><b>{x.tf}</b><span>{x.role}</span>{x.requiredNext&&<Badge tone="amber">required next</Badge>}</label><TextInput placeholder="notes" value={x.notes} onChange={e=>updScreen(i,'notes',e.target.value)}/></div>)}</Card></section></>
 }
+
+function ActionDesk({state, markTaken, closeTrade, archiveSetup, setPage}){
+  const planned = state.setups.filter(s=>!s.taken && !['CLOSED'].includes(s.status)).map(s=>({ setup:s, evidence:analyzePlannedSetup(s, state.prices[s.market]) }))
+  const ready = planned.filter(x=>x.evidence.status==='READY')
+  const watch = planned.filter(x=>['WATCH','WAITING','TOO FAR','NO DATA'].includes(x.evidence.status))
+  const invalid = planned.filter(x=>['INVALIDATED','TARGET HIT','SKIPPED'].includes(x.evidence.status) || x.setup.status==='SKIPPED')
+  const active = state.trades.filter(t=>!['CLOSED','INVALIDATED'].includes(t.status))
+  return <>
+    <Header kicker="Manual Trading Desk" title="Action Desk" sub="TradingView is your analysis. This screen turns your plan into action: wait, get ready, place in MT5, manage, journal."/>
+    <Card className="command actionHero"><div><span className="muted">NEXT ACTION</span><h2>{ready[0]?.setup.market || watch[0]?.setup.market || 'No setup'}</h2><p>{ready[0] ? ready[0].evidence.action : watch[0] ? watch[0].evidence.action : 'Create a setup from your TradingView analysis.'}</p></div><div className="verdict"><Badge tone={ready.length?'green':'neutral'}>{ready.length ? 'READY' : 'WAIT'}</Badge><strong>{ready.length}</strong></div><div className="actions"><Button onClick={()=>setPage('newsetup')}>New setup</Button><Button tone="steel" onClick={()=>setPage('live')}>Check prices</Button></div></Card>
+    <div className="stats mini"><Card><span>READY</span><b className="greenText">{ready.length}</b></Card><Card><span>WATCH</span><b>{watch.length}</b></Card><Card><span>ACTIVE</span><b>{active.length}</b></Card><Card><span>INVALID/LATE</span><b className="redText">{invalid.length}</b></Card></div>
+    <section><h3>Ready to act</h3>{ready.length?ready.map(x=><ActionSetupCard key={x.setup.id} setup={x.setup} evidence={x.evidence} markTaken={markTaken} archiveSetup={archiveSetup} accountSize={state.settings.accountSize}/>):<Empty text="No READY setups. Do not force action."/>}</section>
+    <section><h3>Watching / waiting</h3>{watch.length?watch.map(x=><ActionSetupCard key={x.setup.id} setup={x.setup} evidence={x.evidence} markTaken={markTaken} archiveSetup={archiveSetup} accountSize={state.settings.accountSize}/>):<Empty text="No planned setups. Create one from TradingView."/>}</section>
+    <section><h3>Active MT5 trades</h3>{active.length?active.map(t=><TradeMonitor key={t.id} trade={t} price={state.prices[t.market]?.price} closeTrade={closeTrade}/>):<Empty text="No active trades marked in the app."/>}</section>
+    <section><h3>Invalid / late / skipped</h3>{invalid.length?invalid.map(x=><ActionSetupCard key={x.setup.id} setup={x.setup} evidence={x.evidence} markTaken={markTaken} archiveSetup={archiveSetup} accountSize={state.settings.accountSize}/>):<Empty text="Nothing invalidated."/>}</section>
+  </>
+}
+function ActionSetupCard({setup,evidence,markTaken,archiveSetup,accountSize}){
+  const rc = riskCalc({accountSize, market:setup.market, entry:setup.entry, sl:setup.sl, tp1:setup.tp1, riskPct:setup.riskPct})
+  return <Card className="setup actionCard"><div className="setupTop"><b>{setup.market} {setup.direction}</b><Badge tone={statusTone(evidence.status)}>{evidence.status}</Badge></div><h4>{setup.grade || 'B'} · {setup.riskPct}% risk</h4><p><b>{evidence.reason}</b></p><p className="muted">Action: {evidence.action}</p><dl><dt>Entry</dt><dd>{setup.entryHigh && String(setup.entryHigh)!==String(setup.entry)?`${setup.entry} - ${setup.entryHigh}`:setup.entry||'—'}</dd><dt>SL</dt><dd>{setup.sl||'—'}</dd><dt>TP</dt><dd>{[setup.tp1,setup.tp2,setup.tp3].filter(Boolean).join(' / ')||'—'}</dd><dt>Lot est.</dt><dd>{rc.size ? fmt(rc.size,4) : '—'} · RR {rc.rr?`1:${rc.rr.toFixed(2)}`:'—'}</dd></dl><div className="checklistMini"><span>{setup.checklist?.htf?'✅':'⬜'} HTF</span><span>{setup.checklist?.liquidity?'✅':'⬜'} Liquidity</span><span>{setup.checklist?.bos?'✅':'⬜'} BOS</span><span>{setup.checklist?.risk?'✅':'⬜'} Risk</span></div><p className="muted">Reason: {setup.reason}</p><div className="row">{evidence.status==='READY' && <Button tone="green" onClick={()=>markTaken(setup)}>Trade placed in MT5</Button>}<Button tone="steel" onClick={()=>archiveSetup(setup.id,'SKIPPED')}>Skip / archive</Button></div></Card>
+}
+function NewSetup({state, saveManualSetup, setPage}){
+  const [plan,setPlan]=useState({market:'XAUUSD',direction:'LONG',entry:'',entryHigh:'',sl:'',tp1:'',tp2:'',tp3:'',riskPct:0.5,grade:'B',reason:'',missing:'Final TradingView confirmation',checklist:{htf:false,liquidity:false,bos:false,risk:true}})
+  const set=(k,v)=>setPlan(p=>({...p,[k]:v}))
+  const setCheck=(k,v)=>setPlan(p=>({...p,checklist:{...p.checklist,[k]:v}}))
+  const rc = riskCalc({accountSize:state.settings.accountSize, market:plan.market, entry:normalizePriceInput(plan.entry, plan.market), sl:normalizePriceInput(plan.sl, plan.market), tp1:normalizePriceInput(plan.tp1, plan.market), riskPct:plan.riskPct})
+  const ready = normalizePriceInput(plan.entry, plan.market)!==null && normalizePriceInput(plan.sl, plan.market)!==null && normalizePriceInput(plan.tp1, plan.market)!==null && Number(plan.riskPct) <= Number(state.settings.maxRiskPct || 1)
+  return <>
+    <Header kicker="TradingView → Action" title="Create manual setup" sub="Use this after your morning/evening TradingView analysis. The app then watches price and tells you when to act."/>
+    <Card><div className="zoneGrid"><Field label="Market"><Select value={plan.market} onChange={e=>set('market',e.target.value)}>{MARKET_LIST.map(m=><option key={m}>{m}</option>)}</Select></Field><Field label="Direction"><Select value={plan.direction} onChange={e=>set('direction',e.target.value)}><option>LONG</option><option>SHORT</option></Select></Field><Field label="Entry from"><TextInput placeholder="2328.50" value={plan.entry} onChange={e=>set('entry',e.target.value)}/></Field><Field label="Entry to"><TextInput placeholder="2330.00" value={plan.entryHigh} onChange={e=>set('entryHigh',e.target.value)}/></Field><Field label="Stop loss"><TextInput value={plan.sl} onChange={e=>set('sl',e.target.value)}/></Field><Field label="TP1"><TextInput value={plan.tp1} onChange={e=>set('tp1',e.target.value)}/></Field><Field label="TP2"><TextInput value={plan.tp2} onChange={e=>set('tp2',e.target.value)}/></Field><Field label="TP3"><TextInput value={plan.tp3} onChange={e=>set('tp3',e.target.value)}/></Field><Field label="Risk %"><TextInput value={plan.riskPct} onChange={e=>set('riskPct',e.target.value)}/></Field><Field label="Grade"><Select value={plan.grade} onChange={e=>set('grade',e.target.value)}>{GRADES.filter(g=>g!=='REJECT').map(g=><option key={g}>{g}</option>)}</Select></Field></div><Field label="Why this setup?"><Area value={plan.reason} onChange={e=>set('reason',e.target.value)} placeholder="Example: 4H demand + liquidity sweep + 1H displacement expected."/></Field><Field label="What must still be true before taking it?"><Area value={plan.missing} onChange={e=>set('missing',e.target.value)}/></Field><div className="checklistMini big"><label><input type="checkbox" checked={plan.checklist.htf} onChange={e=>setCheck('htf',e.target.checked)}/> HTF bias clear</label><label><input type="checkbox" checked={plan.checklist.liquidity} onChange={e=>setCheck('liquidity',e.target.checked)}/> Liquidity story</label><label><input type="checkbox" checked={plan.checklist.bos} onChange={e=>setCheck('bos',e.target.checked)}/> BOS/displacement</label><label><input type="checkbox" checked={plan.checklist.risk} onChange={e=>setCheck('risk',e.target.checked)}/> Risk allowed</label></div><div className="stats mini"><Card><span>Risk $</span><b>${fmt(rc.dollars)}</b></Card><Card><span>Lot estimate</span><b>{fmt(rc.size,4)}</b></Card><Card><span>RR</span><b>{rc.rr?`1:${rc.rr.toFixed(2)}`:'—'}</b></Card><Card><span>Status</span><b className={ready?'greenText':'redText'}>{ready?'READY TO SAVE':'MISSING LEVELS'}</b></Card></div><div className="row"><Button disabled={!ready} onClick={()=>saveManualSetup(plan)}>Save setup to Action Desk</Button><Button tone="steel" onClick={()=>setPage('action')}>Back to Action Desk</Button></div></Card>
+  </>
+}
 function Risk({state}){ const [form,setForm]=useState({market:'XAUUSD',entry:'2328.50',sl:'2321.80',tp1:'2340',riskPct:1}); const r=riskCalc({accountSize:state.settings.accountSize,...form}); const set=(k,v)=>setForm({...form,[k]:v}); return <><Header kicker="Risk Calculator" title="Size before execution" sub="Max 1%. Estimates only — verify inside broker."/><Card><div className="zoneGrid"><Field label="Market"><Select value={form.market} onChange={e=>set('market',e.target.value)}>{MARKET_LIST.map(m=><option key={m}>{m}</option>)}</Select></Field><Field label="Risk %"><TextInput value={form.riskPct} onChange={e=>set('riskPct',e.target.value)}/></Field><Field label="Entry"><TextInput value={form.entry} onChange={e=>set('entry',e.target.value)}/></Field><Field label="SL"><TextInput value={form.sl} onChange={e=>set('sl',e.target.value)}/></Field><Field label="TP1"><TextInput value={form.tp1} onChange={e=>set('tp1',e.target.value)}/></Field></div></Card><div className="stats"><Card><span>Dollar risk</span><b>${fmt(r.dollars)}</b></Card><Card><span>Position estimate</span><b>{fmt(r.size,4)}</b></Card><Card><span>RR to TP1</span><b>{r.rr?`1:${r.rr.toFixed(2)}`:'—'}</b></Card><Card><span>Status</span><b className={r.ok?'greenText':'redText'}>{r.ok?'APPROVED':'REJECTED'}</b></Card></div></> }
 function Trades({state,closeTrade}){ return <><Header kicker="Trades" title="Active trade monitor" sub="Track floating R and manage according to plan."/>{state.trades.length?state.trades.map(t=><TradeMonitor key={t.id} trade={t} price={state.prices[t.market]?.price} closeTrade={closeTrade}/>):<Empty text="No trades."/>}</> }
 function Journal({state,update}){ const [form,setForm]=useState({market:'XAUUSD',date:new Date().toISOString(),session:'London',setupType:'',decision:'WAIT',taken:false,result:'skipped',r:0,classification:'Variance',mistake:'None',emotion:'Calm',lesson:''}); function add(){ update(s=>{ s.journal.unshift({...form,id:id('J')}); return s }) } return <><Header kicker="Journal" title="Every setup is a dossier" sub="Classify losses correctly: variance is not a mistake."/><Card><div className="zoneGrid"><Field label="Market"><Select value={form.market} onChange={e=>setForm({...form,market:e.target.value})}>{MARKET_LIST.map(m=><option key={m}>{m}</option>)}</Select></Field><Field label="Session"><Select value={form.session} onChange={e=>setForm({...form,session:e.target.value})}>{SESSIONS.map(s=><option key={s}>{s}</option>)}</Select></Field><Field label="Classification"><Select value={form.classification} onChange={e=>setForm({...form,classification:e.target.value})}>{MISTAKES.slice(1,7).map(m=><option key={m}>{m}</option>)}</Select></Field><Field label="Mistake"><Select value={form.mistake} onChange={e=>setForm({...form,mistake:e.target.value})}>{MISTAKES.map(m=><option key={m}>{m}</option>)}</Select></Field><Field label="R result"><TextInput value={form.r} onChange={e=>setForm({...form,r:e.target.value})}/></Field></div><Field label="Lesson"><Area value={form.lesson} onChange={e=>setForm({...form,lesson:e.target.value})}/></Field><Button onClick={add}>Add journal item</Button></Card><div>{state.journal.map(j=><Card key={j.id} className="journal"><b>{j.market}</b><Badge tone={j.result==='win'?'green':j.result==='loss'?'red':'neutral'}>{j.result}</Badge><p>{j.classification} · {j.mistake} · {j.r}R</p><small>{j.lesson}</small></Card>)}</div></> }
 function Learning({state}){ const l=learning(state.journal); return <><Header kicker="Self-Learning" title="Evidence, not panic" sub="The strategy changes only when repeated data demands it."/><div className="banner open">1 = observation · 3 = pattern · 5 = hypothesis · 10 = strong · 20 = rule candidate</div>{l.map(x=><Card key={x.label} className="learn"><b>{x.label}</b><Badge tone={x.count>=5?'amber':'neutral'}>{x.tier}</Badge><p>{x.count} recurring examples</p></Card>)}</> }
 function Daily({state,update}){ const d=state.daily; const set=(k,v)=>update(s=>{ s.daily[k]=v; return s }); return <><Header kicker="Daily Flow" title="Run the day like a desk" sub="Morning scan → active watch → decision → evening review."/><Card><div className="zoneGrid"><Field label="Primary market"><Select value={d.primary} onChange={e=>set('primary',e.target.value)}>{MARKET_LIST.map(m=><option key={m}>{m}</option>)}</Select></Field><Field label="Secondary"><Select value={d.secondary} onChange={e=>set('secondary',e.target.value)}>{MARKET_LIST.map(m=><option key={m}>{m}</option>)}</Select></Field><Field label="Mental state"><TextInput value={d.mental} onChange={e=>set('mental',e.target.value)}/></Field><Field label="Max trades"><TextInput value={d.maxTrades} onChange={e=>set('maxTrades',e.target.value)}/></Field></div><Field label="Today’s command"><Area value={d.command} onChange={e=>set('command',e.target.value)}/></Field><Field label="High-impact news"><Area value={d.news} onChange={e=>set('news',e.target.value)}/></Field></Card></> }
 function Weekly({state}){ const j=state.journal; const taken=j.filter(x=>x.taken); const wins=taken.filter(x=>x.result==='win').length; const losses=taken.filter(x=>x.result==='loss').length; const net=taken.reduce((a,x)=>a+(Number(x.r)||0),0); const learn=learning(j)[0]; return <><Header kicker="Weekly CEO Review" title="Prop-desk performance review" sub="What improved expectancy, what destroyed it, and what changes next week."/><div className="stats"><Card><span>Trades</span><b>{taken.length}</b></Card><Card><span>Winrate</span><b>{wins+losses?Math.round(wins/(wins+losses)*100):0}%</b></Card><Card><span>Net R</span><b className={net>=0?'greenText':'redText'}>{net.toFixed(1)}R</b></Card><Card><span>Repeated pattern</span><b>{learn?.label || 'none'}</b></Card></div><Card><h3>Next week focus</h3><p>{learn ? `Reduce: ${learn.label}. Proposed test: no A rating unless this failure mode is explicitly blocked.` : 'Keep collecting clean data.'}</p></Card></> }
-function Settings({state,update}){ const set=(k,v)=>update(s=>{ s.settings[k]=v; return s }); function exportJson(){ const blob=new Blob([JSON.stringify(state,null,2)],{type:'application/json'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='project-takeover-backup.json'; a.click() } return <><Header kicker="Settings" title="Your desk" sub="API keys in localStorage are not secret. Move to serverless functions later."/><Card><div className="zoneGrid"><Field label="Trader"><TextInput value={state.settings.trader} onChange={e=>set('trader',e.target.value)}/></Field><Field label="Account size"><TextInput value={state.settings.accountSize} onChange={e=>set('accountSize',e.target.value)}/></Field><Field label="Max risk"><TextInput value={state.settings.maxRiskPct} onChange={e=>set('maxRiskPct',e.target.value)}/></Field><Field label="Data provider"><Select value={state.settings.dataProvider} onChange={e=>set('dataProvider',e.target.value)}><option value="manual">Manual</option><option value="finnhub">Finnhub</option><option value="twelve">Twelve Data</option></Select></Field><Field label="Finnhub API key"><TextInput value={state.settings.finnhubKey} onChange={e=>set('finnhubKey',e.target.value)}/></Field><Field label="Twelve Data API key"><TextInput value={state.settings.twelveKey} onChange={e=>set('twelveKey',e.target.value)}/></Field><Field label="Poll seconds"><TextInput value={state.settings.pollSeconds} onChange={e=>set('pollSeconds',e.target.value)}/></Field><Field label="Economic Calendar URL"><TextInput value={state.settings.economicCalendarUrl} onChange={e=>set('economicCalendarUrl',e.target.value)}/></Field></div><Button onClick={exportJson}>Export backup</Button></Card></> }
+function Settings({state,update}){ const set=(k,v)=>update(s=>{ s.settings[k]=v; return s }); function exportJson(){ const blob=new Blob([JSON.stringify(state,null,2)],{type:'application/json'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='project-takeover-backup.json'; a.click() } return <><Header kicker="Settings" title="Your desk" sub="API keys in localStorage are not secret. Move to serverless functions later."/><Card><div className="zoneGrid"><Field label="Trader"><TextInput value={state.settings.trader} onChange={e=>set('trader',e.target.value)}/></Field><Field label="Account size"><TextInput value={state.settings.accountSize} onChange={e=>set('accountSize',e.target.value)}/></Field><Field label="Max risk"><TextInput value={state.settings.maxRiskPct} onChange={e=>set('maxRiskPct',e.target.value)}/></Field><Field label="Data provider"><Select value={state.settings.dataProvider} onChange={e=>set('dataProvider',e.target.value)}><option value="manual">Manual</option><option value="auto">Auto router</option><option value="finnhub">Finnhub</option><option value="twelve">Twelve Data</option></Select></Field><Field label="Finnhub API key"><TextInput value={state.settings.finnhubKey} onChange={e=>set('finnhubKey',e.target.value)}/></Field><Field label="Twelve Data API key"><TextInput value={state.settings.twelveKey} onChange={e=>set('twelveKey',e.target.value)}/></Field><Field label="Poll seconds"><TextInput value={state.settings.pollSeconds} onChange={e=>set('pollSeconds',e.target.value)}/></Field><Field label="Economic Calendar URL"><TextInput value={state.settings.economicCalendarUrl} onChange={e=>set('economicCalendarUrl',e.target.value)}/></Field></div><Button onClick={exportJson}>Export backup</Button></Card></> }
 
 export default App
