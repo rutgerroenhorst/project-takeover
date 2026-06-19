@@ -1,35 +1,54 @@
-# Project Takeover V4 — Action Desk
+# Project Takeover V5 — Auto Setup Scanner
 
-Manual trading desk for phone-first action.
+This version is no longer a manual setup desk. It is an automatic SMC setup scanner prototype.
 
-## What is new
+## Core workflow
 
-- Action Desk page: READY / WATCH / ACTIVE / INVALID overview
-- New Setup page: create a trade plan from TradingView
-- Mark trade as placed in MT5
-- Active Trades + Journal flow
-- Smart provider router option
-- Better price validation for XAUUSD / FX / proxy markets
-- Manual price input handles Dutch format like `2.325` for gold as `2325`
-- Provider errors become NO DATA instead of fake TP / TARGET HIT
+Real-time Twelve Data candles → SMC checklist engine → setup score → WATCH / READY / INVALIDATED → optional Telegram alert → manual MT5 execution.
 
-## Intended workflow
+## Markets
 
-TradingView = analysis.
-Project Takeover = setup plan, risk, action, tracking, journal.
-MT5 = manual execution for now.
+V5 focuses only on:
 
-## Run
+- XAUUSD
+- EURUSD
+- GBPUSD
+- USDJPY
+
+NQ/ES are intentionally parked because free futures data/proxy feeds were not reliable enough.
+
+## What the scanner checks
+
+- HTF bias from D1 / 4H candles
+- External liquidity sweep
+- 1H BOS / structure break
+- Displacement candle
+- Refined FVG / imbalance zone
+- Freshness / mitigation
+- Retest into entry zone
+- RR filter
+
+## Important
+
+This is a decision-assistant and scanner, not a profit guarantee and not auto-execution. The user still executes manually in MT5.
+
+## Install
 
 ```bash
+cd ~/Downloads
+unzip -o project-takeover-v5-auto-scanner.zip
+rsync -av project-takeover-v5-auto-scanner/ project-takeover/
+cd project-takeover
+rm -rf node_modules package-lock.json
 npm install
-npm run dev
+npm run build
+git add .
+git commit -m "Add V5 auto setup scanner"
+git push -f origin main
 ```
 
-## Deploy
+## Settings
 
-Push to GitHub. Vercel will build with `npm run build`.
+Add your Twelve Data API key in Settings. Keep polling at 60 seconds or higher because the free plan has strict request limits.
 
-## Safety
-
-This app does not place broker orders. Verify every setup in TradingView/MT5. API keys stored in browser localStorage are not secret.
+Telegram is optional. Add bot token and chat ID on the Telegram page, then test alert.

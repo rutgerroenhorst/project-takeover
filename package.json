@@ -1,20 +1,19 @@
 {
-  "name": "project-takeover-action-desk",
+  "name": "project-takeover-v5-auto-scanner",
+  "version": "5.0.0",
   "private": true,
-  "version": "4.0.0",
   "type": "module",
-  "description": "Project Takeover V4 Action Desk: manual TradingView setup planner, live/manual price radar, MT5 action flow, risk and journal OS. No auto execution.",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview"
   },
   "dependencies": {
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "@vitejs/plugin-react": "latest",
+    "vite": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "lucide-react": "latest"
   },
-  "devDependencies": {
-    "@vitejs/plugin-react": "^4.3.4",
-    "vite": "^5.4.10"
-  }
+  "devDependencies": {}
 }

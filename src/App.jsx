@@ -1,427 +1,600 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
+import { Activity, AlertTriangle, Bell, CheckCircle2, Crosshair, Play, Radar, RefreshCw, Settings, Shield, Target, XCircle } from 'lucide-react'
 
-const STORAGE_KEY = 'project_takeover_action_desk_v4'
+const STORAGE_KEY = 'project_takeover_v5_auto_setup_scanner'
 
-const MARKET_DEFS = {
-  XAUUSD: { name: 'Gold', type: 'metal', finnhub: 'OANDA:XAU_USD', twelve: 'XAU/USD', proxy: 'XAUUSD' },
-  NQ: { name: 'Nasdaq 100', type: 'index', finnhub: 'QQQ', twelve: 'QQQ', proxy: 'QQQ proxy' },
-  ES: { name: 'S&P 500', type: 'index', finnhub: 'SPY', twelve: 'SPY', proxy: 'SPY proxy' },
-  EURUSD: { name: 'Euro / USD', type: 'fx', finnhub: 'OANDA:EUR_USD', twelve: 'EUR/USD', proxy: 'EURUSD' },
-  GBPUSD: { name: 'Pound / USD', type: 'fx', finnhub: 'OANDA:GBP_USD', twelve: 'GBP/USD', proxy: 'GBPUSD' },
-  USDJPY: { name: 'USD / Yen', type: 'fx', finnhub: 'OANDA:USD_JPY', twelve: 'USD/JPY', proxy: 'USDJPY' },
+const MARKETS = {
+  XAUUSD: { name: 'Gold', symbol: 'XAU/USD', type: 'metal', precision: 2, valid: [1000, 10000] },
+  EURUSD: { name: 'Euro / USD', symbol: 'EUR/USD', type: 'fx', precision: 5, valid: [0.5, 2.5] },
+  GBPUSD: { name: 'Pound / USD', symbol: 'GBP/USD', type: 'fx', precision: 5, valid: [0.5, 2.5] },
+  USDJPY: { name: 'USD / Yen', symbol: 'USD/JPY', type: 'fx', precision: 3, valid: [50, 250] },
 }
-const MARKET_LIST = Object.keys(MARKET_DEFS)
-const SETUP_STATES = ['NO DATA','NO SETUP','TOO FAR','WATCH','FORMING','READY','TRIGGERED','MANAGING','TARGET HIT','INVALIDATED','CLOSED']
-const GRADES = ['A+','A','B','C','REJECT']
-const MISTAKES = ['None','Variance','Execution mistake','Emotional mistake','Strategy mistake','Missed trade','Good skip','Entered too early','Chased entry','Oversized risk','No HTF displacement','News blindside']
-const SESSIONS = ['Asia','London','NY AM','NY PM','Overlap']
+const MARKET_LIST = Object.keys(MARKETS)
+const INTERVALS = ['1day', '4h', '1h', '15min']
+const STATUS_ORDER = ['NO DATA', 'NO SETUP', 'FORMING', 'WATCH', 'BOS CONFIRMED', 'READY', 'ACTIVE', 'INVALIDATED', 'MISSED', 'CLOSED']
 
-const TF = {
-  metal: [ ['W1','macro regime'], ['D1','institutional direction'], ['4H','structure bias'], ['1H','trade context'], ['15M','setup validation'], ['5M','precision entry'], ['1M','optional only'] ],
-  index: [ ['D1','macro / risk regime'], ['4H','higher-timeframe structure'], ['1H','session bias'], ['15M','setup validation'], ['5M','execution'], ['1M','optional only'] ],
-  fx: [ ['W1/D1','macro / rate direction'], ['4H','structure'], ['1H','context'], ['15M','validation'], ['5M','precision'] ],
+const RULES = [
+  'Geen complete SMC-story = geen setup.',
+  'Geen HTF bias = geen setup.',
+  'Geen liquidity sweep = geen setup.',
+  'Geen 1H BOS / displacement = geen entry.',
+  'Geen FVG / OB retest = geen entry.',
+  'Geen minimaal 1:3 RR = geen READY alert.',
+  'Geen betrouwbare candle data = geen signaal.',
+  'Max risk standaard 1%. Jij voert handmatig uit in MT5.',
+]
+
+const DEFAULT_SETTINGS = {
+  twelveKey: '',
+  accountSize: 10000,
+  riskPct: 1,
+  pollSeconds: 60,
+  autoRefresh: false,
+  focusMarket: 'XAUUSD',
+  alertWatch: true,
+  alertReady: true,
+  alertInvalid: true,
+  telegramBotToken: '',
+  telegramChatId: '',
 }
 
-function todayISO(){ return new Date().toISOString().slice(0,10) }
-function id(prefix='S'){ return `${prefix}-${Math.random().toString(36).slice(2,6).toUpperCase()}` }
-function n(v){
+const DEFAULT_STATE = {
+  settings: DEFAULT_SETTINGS,
+  analyses: {},
+  candles: {},
+  activeTrades: [],
+  journal: [],
+  alertLog: [],
+}
+
+function clone(x) { return JSON.parse(JSON.stringify(x)) }
+function uid(prefix = 'ID') { return `${prefix}-${Math.random().toString(36).slice(2, 7).toUpperCase()}` }
+function nowIso() { return new Date().toISOString() }
+function today() { return new Date().toISOString().slice(0, 10) }
+function n(v) {
   if (v === null || v === undefined || v === '') return null
-  const raw = String(v).trim().replace(/\s/g,'')
+  const raw = String(v).trim().replace(/\s/g, '')
   const normalized = raw.includes(',') && !raw.includes('.') ? raw.replace(',', '.') : raw
   const x = Number(normalized)
   return Number.isFinite(x) ? x : null
 }
-function normalizePriceInput(raw, sym){
-  if (raw === null || raw === undefined || raw === '') return null
-  if (typeof raw === 'number') return Number.isFinite(raw) ? raw : null
-  let s = String(raw).trim().replace(/\s/g,'')
-  // Dutch thousands for gold/index style: 2.325 => 2325, 2.325,80 => 2325.80
-  if (['XAUUSD','NQ','ES'].includes(sym)) {
-    if (/^\d{1,3}\.\d{3}$/.test(s)) s = s.replace('.', '')
-    else if (/^\d{1,3}\.\d{3},\d+$/.test(s)) s = s.replace(/\./g,'').replace(',', '.')
-    else if (/^\d+,\d+$/.test(s)) s = s.replace(',', '.')
-  } else {
-    // Forex: 1,1547 => 1.1547
-    s = s.replace(',', '.')
+function fmt(v, sym = 'XAUUSD') {
+  const x = n(v)
+  if (x === null) return '—'
+  return x.toLocaleString(undefined, { maximumFractionDigits: MARKETS[sym]?.precision ?? 2 })
+}
+function pct(v) { const x = n(v); return x === null ? '—' : `${x.toFixed(1)}%` }
+function classForStatus(status) {
+  if (status === 'READY') return 'green'
+  if (['WATCH', 'BOS CONFIRMED', 'FORMING', 'ACTIVE'].includes(status)) return 'amber'
+  if (['INVALIDATED', 'MISSED'].includes(status)) return 'red'
+  if (status === 'NO DATA') return 'blue'
+  return 'neutral'
+}
+function safePrice(sym, price) {
+  const p = n(price)
+  if (p === null || p <= 0) return null
+  const [min, max] = MARKETS[sym]?.valid || [0, Infinity]
+  return p >= min && p <= max ? p : null
+}
+function loadState() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null')
+    if (!raw) return clone(DEFAULT_STATE)
+    return {
+      ...clone(DEFAULT_STATE),
+      ...raw,
+      settings: { ...DEFAULT_SETTINGS, ...(raw.settings || {}) },
+      analyses: raw.analyses || {},
+      candles: raw.candles || {},
+      activeTrades: Array.isArray(raw.activeTrades) ? raw.activeTrades : [],
+      journal: Array.isArray(raw.journal) ? raw.journal : [],
+      alertLog: Array.isArray(raw.alertLog) ? raw.alertLog : [],
+    }
+  } catch {
+    return clone(DEFAULT_STATE)
   }
-  const x = Number(s)
-  return Number.isFinite(x) ? x : null
 }
-function isValidMarketPrice(sym, price){
-  const p = Number(price)
-  if (!Number.isFinite(p) || p <= 0) return false
-  if (sym === 'XAUUSD') return p >= 1000 && p <= 10000
-  if (sym === 'EURUSD' || sym === 'GBPUSD') return p >= 0.5 && p <= 2.5
-  if (sym === 'USDJPY') return p >= 50 && p <= 250
-  if (sym === 'NQ' || sym === 'ES') return p >= 50 && p <= 2000 // current free feed uses QQQ/SPY proxies
-  return true
-}
-function fmt(v, d=2){ const x=n(v); return x===null ? '—' : x.toLocaleString(undefined,{maximumFractionDigits:d}) }
-function priceDecimals(sym){ return sym === 'USDJPY' ? 3 : MARKET_DEFS[sym]?.type === 'fx' ? 5 : 2 }
-function displayPrice(sym, v){ const x=livePrice(v, sym); return x===null ? '—' : x.toLocaleString(undefined,{maximumFractionDigits:priceDecimals(sym)}) }
-function pct(v){ const x=n(v); return x===null ? '—' : `${x.toFixed(2)}%` }
-function clamp(v,a,b){ return Math.max(a, Math.min(b, v)) }
-function directionSign(direction){ return direction === 'LONG' ? 1 : direction === 'SHORT' ? -1 : 0 }
-function livePrice(v, sym=null){ const x = normalizePriceInput(v, sym || 'GENERIC'); if (x === null || x <= 0) return null; return sym ? (isValidMarketPrice(sym, x) ? x : null) : x }
-function statusTone(status){ return status === 'READY' ? 'green' : status === 'TARGET HIT' || status === 'TP1 HIT' || status === 'MANAGING' || status === 'WATCH' || status === 'FORMING' || status === 'WAITING' ? 'amber' : status === 'INVALIDATED' || status === 'SL HIT' || status === 'SKIPPED' ? 'red' : 'neutral' }
-function hasZone(z){ return [z?.watchLow,z?.watchHigh,z?.entryLow,z?.entryHigh,z?.invalidation,z?.tp1].some(v => n(v) !== null) }
-function formatTime(v){ if(!v) return '—'; try { return new Date(v).toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' }) } catch { return '—' } }
 
-function defaultZones(){
-  return MARKET_LIST.reduce((acc, sym) => {
-    acc[sym] = { watchLow:'', watchHigh:'', entryLow:'', entryHigh:'', invalidation:'', tp1:'', tp2:'', tp3:'', direction:'LONG', htfBias:'neutral', setupType:'', requiredConfirmation:'1H displacement + 15M retest' }
-    return acc
-  }, {})
+function parseTwelveCandles(payload) {
+  if (!payload || payload.status === 'error' || payload.code || payload.message) {
+    throw new Error(payload?.message || payload?.code || 'Twelve Data returned an error')
+  }
+  const values = payload.values || []
+  return values.map(c => ({
+    time: c.datetime,
+    open: Number(c.open),
+    high: Number(c.high),
+    low: Number(c.low),
+    close: Number(c.close),
+  })).filter(c => [c.open, c.high, c.low, c.close].every(Number.isFinite)).reverse()
 }
-function defaultPrices(){ return MARKET_LIST.reduce((a,s)=>{ a[s] = { price:null, source:'manual', status:'manual', updated:null, error:'' }; return a }, {}) }
-function defaultScreens(){ return MARKET_LIST.reduce((acc, sym)=>{ acc[sym] = (TF[MARKET_DEFS[sym].type]||[]).map(([tf,role],i)=>({tf,role,checked:false,notes:'',requiredNext:i===0})) ; return acc }, {}) }
-function seedState(){
-  const zones = defaultZones()
-  zones.XAUUSD = { watchLow:'2321', watchHigh:'2334', entryLow:'2327.5', entryHigh:'2329.5', invalidation:'2321.8', tp1:'2340', tp2:'2358', tp3:'2380', direction:'LONG', htfBias:'bullish', setupType:'HTF sweep + displacement', requiredConfirmation:'1H displacement + 15M retest' }
-  const setups = []
-  const trades = []
-  const journal = [
-    { id:'J-001', market:'NQ', date:new Date(Date.now()-86400000).toISOString(), session:'NY AM', setupType:'OR breakout', decision:'WAIT', taken:true, result:'loss', r:-1, classification:'Execution mistake', mistake:'Entered too early', emotion:'FOMO', lesson:'Require HTF displacement before A rating.' },
-    { id:'J-002', market:'ES', date:new Date(Date.now()-4*86400000).toISOString(), session:'NY AM', setupType:'Reversal', decision:'WAIT', taken:true, result:'loss', r:-1, classification:'Execution mistake', mistake:'Entered too early', emotion:'FOMO', lesson:'Same early-entry pattern.' },
-    { id:'J-003', market:'NQ', date:new Date(Date.now()-6*86400000).toISOString(), session:'NY AM', setupType:'Continuation', decision:'WAIT', taken:true, result:'loss', r:-1, classification:'Execution mistake', mistake:'Entered too early', emotion:'Anxious', lesson:'Do not enter before 1H confirmation.' },
-    { id:'J-004', market:'GBPUSD', date:new Date(Date.now()-9*86400000).toISOString(), session:'London', setupType:'Sweep + BOS', decision:'TAKE', taken:true, result:'win', r:3.2, classification:'Variance', mistake:'None', emotion:'Focused', lesson:'Good process.' },
+async function fetchTwelveSeries(sym, interval, apiKey, outputsize = 120) {
+  const symbol = MARKETS[sym].symbol
+  const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&outputsize=${outputsize}&apikey=${encodeURIComponent(apiKey)}`
+  const r = await fetch(url)
+  const j = await r.json()
+  return parseTwelveCandles(j)
+}
+function last(arr) { return Array.isArray(arr) && arr.length ? arr[arr.length - 1] : null }
+function avg(arr) { return arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0 }
+function body(c) { return Math.abs(c.close - c.open) }
+function atr(candles, len = 14) {
+  if (!candles || candles.length < 2) return 0
+  const slice = candles.slice(-len)
+  const trs = slice.map((c, i) => {
+    const prev = candles[candles.length - slice.length + i - 1]
+    if (!prev) return c.high - c.low
+    return Math.max(c.high - c.low, Math.abs(c.high - prev.close), Math.abs(c.low - prev.close))
+  })
+  return avg(trs)
+}
+function ema(values, len) {
+  if (!values?.length) return null
+  const k = 2 / (len + 1)
+  let e = values[0]
+  for (let i = 1; i < values.length; i++) e = values[i] * k + e * (1 - k)
+  return e
+}
+function swingHighs(candles, left = 2, right = 2) {
+  const out = []
+  for (let i = left; i < candles.length - right; i++) {
+    let ok = true
+    for (let j = i - left; j <= i + right; j++) if (j !== i && candles[j].high >= candles[i].high) ok = false
+    if (ok) out.push({ index: i, price: candles[i].high, time: candles[i].time })
+  }
+  return out
+}
+function swingLows(candles, left = 2, right = 2) {
+  const out = []
+  for (let i = left; i < candles.length - right; i++) {
+    let ok = true
+    for (let j = i - left; j <= i + right; j++) if (j !== i && candles[j].low <= candles[i].low) ok = false
+    if (ok) out.push({ index: i, price: candles[i].low, time: candles[i].time })
+  }
+  return out
+}
+function htfBias(d1, h4) {
+  const candles = h4?.length >= 60 ? h4 : d1
+  if (!candles?.length) return { direction: 'NEUTRAL', reason: 'No HTF candles.' }
+  const closes = candles.map(c => c.close)
+  const e20 = ema(closes.slice(-80), 20)
+  const e50 = ema(closes.slice(-100), 50)
+  const p = last(candles).close
+  if (e20 && e50 && p > e20 && e20 > e50) return { direction: 'LONG', reason: 'Price above 20/50 EMA structure.' }
+  if (e20 && e50 && p < e20 && e20 < e50) return { direction: 'SHORT', reason: 'Price below 20/50 EMA structure.' }
+  return { direction: 'NEUTRAL', reason: 'HTF is mixed / mid-range.' }
+}
+function detectSweep(candles, direction) {
+  if (!candles || candles.length < 55) return null
+  const recent = candles.slice(-16)
+  const prior = candles.slice(-55, -16)
+  const priorLow = Math.min(...prior.map(c => c.low))
+  const priorHigh = Math.max(...prior.map(c => c.high))
+  for (let i = recent.length - 1; i >= 0; i--) {
+    const c = recent[i]
+    if (direction === 'LONG' && c.low < priorLow && c.close > priorLow) return { ok: true, price: c.low, level: priorLow, time: c.time, text: 'Sell-side liquidity swept and candle closed back above.' }
+    if (direction === 'SHORT' && c.high > priorHigh && c.close < priorHigh) return { ok: true, price: c.high, level: priorHigh, time: c.time, text: 'Buy-side liquidity swept and candle closed back below.' }
+  }
+  return null
+}
+function detectBos(candles, direction) {
+  if (!candles || candles.length < 35) return null
+  const recentClose = last(candles).close
+  const prior = candles.slice(-35, -4)
+  const refHigh = Math.max(...prior.map(c => c.high))
+  const refLow = Math.min(...prior.map(c => c.low))
+  if (direction === 'LONG' && recentClose > refHigh) return { ok: true, level: refHigh, time: last(candles).time, text: '1H close broke previous structure high.' }
+  if (direction === 'SHORT' && recentClose < refLow) return { ok: true, level: refLow, time: last(candles).time, text: '1H close broke previous structure low.' }
+  return null
+}
+function detectDisplacement(candles, direction) {
+  if (!candles || candles.length < 40) return null
+  const avgBody = avg(candles.slice(-35, -5).map(body))
+  const candidates = candles.slice(-8)
+  for (let i = candidates.length - 1; i >= 0; i--) {
+    const c = candidates[i]
+    const isDir = direction === 'LONG' ? c.close > c.open : c.close < c.open
+    if (isDir && body(c) > avgBody * 1.5) return { ok: true, time: c.time, text: 'Strong displacement candle in trade direction.' }
+  }
+  return null
+}
+function detectFvg(candles, direction) {
+  if (!candles || candles.length < 10) return null
+  const start = Math.max(2, candles.length - 28)
+  for (let i = candles.length - 1; i >= start; i--) {
+    const a = candles[i - 2]
+    const c = candles[i]
+    if (!a || !c) continue
+    if (direction === 'LONG' && a.high < c.low) {
+      return { ok: true, low: a.high, high: c.low, mid: (a.high + c.low) / 2, time: c.time, text: 'Bullish FVG / imbalance detected.' }
+    }
+    if (direction === 'SHORT' && a.low > c.high) {
+      return { ok: true, low: c.high, high: a.low, mid: (c.high + a.low) / 2, time: c.time, text: 'Bearish FVG / imbalance detected.' }
+    }
+  }
+  return null
+}
+function nearestLiquidity(candles, direction, entry, fallbackRisk) {
+  const highs = swingHighs(candles || []).map(s => s.price).filter(p => direction === 'LONG' ? p > entry : p < entry)
+  const lows = swingLows(candles || []).map(s => s.price).filter(p => direction === 'LONG' ? p > entry : p < entry)
+  const levels = direction === 'LONG' ? highs.sort((a, b) => a - b) : lows.sort((a, b) => b - a)
+  return levels[0] || (direction === 'LONG' ? entry + fallbackRisk * 3 : entry - fallbackRisk * 3)
+}
+function evaluateDirection(sym, bundles, direction) {
+  const d1 = bundles['1day'] || []
+  const h4 = bundles['4h'] || []
+  const h1 = bundles['1h'] || []
+  const m15 = bundles['15min'] || []
+  const price = safePrice(sym, last(m15)?.close || last(h1)?.close || last(h4)?.close)
+  if (!price) return null
+
+  const bias = htfBias(d1, h4)
+  const sweep = detectSweep(m15, direction) || detectSweep(h1, direction)
+  const bos = detectBos(h1, direction)
+  const displacement = detectDisplacement(h1, direction) || detectDisplacement(m15, direction)
+  const fvg = detectFvg(m15, direction) || detectFvg(h1, direction)
+  const a = atr(m15, 14) || Math.abs(price) * 0.001
+  const entry = fvg?.mid || price
+  const zoneLow = fvg ? Math.min(fvg.low, fvg.high) : null
+  const zoneHigh = fvg ? Math.max(fvg.low, fvg.high) : null
+  const retest = fvg ? price >= zoneLow && price <= zoneHigh : false
+  const nearZone = fvg ? Math.abs(price - entry) <= a * 0.75 : false
+  const sl = direction === 'LONG'
+    ? (sweep?.price || Math.min(...m15.slice(-30).map(c => c.low))) - a * 0.2
+    : (sweep?.price || Math.max(...m15.slice(-30).map(c => c.high))) + a * 0.2
+  const risk = Math.abs(entry - sl)
+  const tp1 = nearestLiquidity(h1, direction, entry, risk)
+  const tp2 = direction === 'LONG' ? Math.max(...h4.slice(-60).map(c => c.high), tp1) : Math.min(...h4.slice(-60).map(c => c.low), tp1)
+  const tp3 = direction === 'LONG' ? entry + risk * 5 : entry - risk * 5
+  const rr = risk > 0 ? Math.abs(tp1 - entry) / risk : 0
+  const fvgMitigated = fvg ? m15.slice(m15.findIndex(c => c.time === fvg.time) + 1).some(c => c.low <= zoneHigh && c.high >= zoneLow) : false
+  const invalidated = direction === 'LONG' ? price <= sl : price >= sl
+
+  const checks = [
+    { key: 'htf', label: 'HTF bias in trade direction', ok: bias.direction === direction, detail: bias.reason, weight: 15 },
+    { key: 'sweep', label: 'External liquidity sweep', ok: !!sweep, detail: sweep?.text || 'No recent sweep confirmed.', weight: 20 },
+    { key: 'bos', label: '1H BOS / structure break', ok: !!bos, detail: bos?.text || 'No valid 1H structure break yet.', weight: 20 },
+    { key: 'displacement', label: 'Displacement candle', ok: !!displacement, detail: displacement?.text || 'No strong impulse candle yet.', weight: 15 },
+    { key: 'fvg', label: 'Refined FVG / imbalance zone', ok: !!fvg, detail: fvg?.text || 'No clean FVG / imbalance zone.', weight: 15 },
+    { key: 'fresh', label: 'Zone is not over-mitigated', ok: !!fvg && !fvgMitigated, detail: fvg ? (fvgMitigated ? 'Zone has already been touched. Treat as lower quality.' : 'Zone still fresh enough.') : 'No zone.', weight: 10 },
+    { key: 'retest', label: 'Price retesting entry zone', ok: retest, detail: fvg ? (retest ? 'Price is inside the FVG zone.' : nearZone ? 'Price is near the zone, not inside yet.' : 'Price is not at entry yet.') : 'No entry zone.', weight: 10 },
+    { key: 'rr', label: 'RR filter valid', ok: rr >= 3, detail: rr ? `Estimated RR to TP1: ${rr.toFixed(2)}R` : 'No RR.', weight: 10 },
   ]
+  const max = checks.reduce((a, c) => a + c.weight, 0)
+  const score = Math.round(checks.reduce((a, c) => a + (c.ok ? c.weight : 0), 0) / max * 100)
+  let status = 'NO SETUP'
+  let next = 'Do nothing. No complete SMC story.'
+  if (invalidated && score >= 60) { status = 'INVALIDATED'; next = 'Setup invalidated. No trade.' }
+  else if (sweep && !bos) { status = 'WATCH'; next = 'Wait for 1H BOS / displacement. No trade yet.' }
+  else if (sweep && bos && !retest) { status = 'BOS CONFIRMED'; next = 'Wait for retest into refined FVG / OB zone.' }
+  else if (score >= 80 && retest && rr >= 3) { status = 'READY'; next = 'Open MT5. Place trade only if price is still inside entry zone.' }
+  else if (score >= 60) { status = 'WATCH'; next = 'Setup forming. Wait for missing confirmations.' }
+  else if (score >= 40) { status = 'FORMING'; next = 'Early structure only. No trade.' }
+
   return {
-    settings:{ trader:'Operator', accountSize:10000, maxRiskPct:1, dataProvider:'manual', finnhubKey:'', twelveKey:'', pollSeconds:60, economicCalendarUrl:'', customWebhookUrl:'' },
-    prices: defaultPrices(), zones, setups, trades, journal, screens: defaultScreens(),
-    daily:{ date:todayISO(), sleep:'good', mental:'calm', news:'', primary:'XAUUSD', secondary:'EURUSD', noTrade:'', maxRisk:1, maxTrades:3, command:'Focus on Gold first. Everything else must prove itself.' },
-    rules:['Never risk more than 1% on a single trade.','Live price can only trigger WATCH / READY / INVALID — never TAKE.','No A+ without HTF bias + liquidity + displacement + valid RR.','Two losses in one day: stop or reduce to 0.25%.','One normal loss is variance, not a strategy change.']
+    id: `${sym}-${direction}-${Date.now()}`,
+    sym,
+    direction,
+    status,
+    score,
+    price,
+    updated: nowIso(),
+    next,
+    bias,
+    checks,
+    setup: {
+      entryLow: zoneLow,
+      entryHigh: zoneHigh,
+      entry: entry,
+      sl,
+      tp1,
+      tp2,
+      tp3,
+      rr,
+      risk,
+      source: fvg ? `${fvg.text} @ ${fvg.time}` : 'No refined zone yet',
+    },
   }
 }
-
-function sanitizeState(raw){
-  const base = seedState()
-  const s = raw && typeof raw === 'object' ? { ...base, ...raw } : base
-  s.settings = { ...base.settings, ...(raw?.settings || {}) }
-  s.zones = { ...defaultZones(), ...(raw?.zones || {}) }
-  s.prices = { ...defaultPrices(), ...(raw?.prices || {}) }
-  for (const sym of MARKET_LIST) {
-    const x = livePrice(s.prices[sym]?.price, sym)
-    s.prices[sym] = { ...defaultPrices()[sym], ...(s.prices[sym] || {}), price: x }
-    if (!x && s.prices[sym].status !== 'error') s.prices[sym].status = s.prices[sym].source || 'manual'
+function analyzeMarket(sym, bundles) {
+  const hasEnough = INTERVALS.every(tf => bundles?.[tf]?.length >= 40)
+  if (!hasEnough) {
+    return { sym, status: 'NO DATA', score: 0, updated: nowIso(), error: 'Not enough candle data. Need D1/4H/1H/15M.', checks: [], setup: {}, price: null, next: 'Fix API key or wait for data.' }
   }
-  s.setups = Array.isArray(raw?.setups) ? raw.setups.filter(x => x && x.market && x.id) : []
-  s.trades = Array.isArray(raw?.trades) ? raw.trades.filter(x => x && x.market && x.id && x.notes !== 'Seed example.' && livePrice(s.prices[x.market]?.price) !== null) : []
-  s.journal = Array.isArray(raw?.journal) ? raw.journal : base.journal
-  s.screens = { ...defaultScreens(), ...(raw?.screens || {}) }
-  s.daily = { ...base.daily, ...(raw?.daily || {}) }
-  s.rules = Array.isArray(raw?.rules) ? raw.rules : base.rules
-  return s
+  const long = evaluateDirection(sym, bundles, 'LONG')
+  const short = evaluateDirection(sym, bundles, 'SHORT')
+  const best = [long, short].filter(Boolean).sort((a, b) => b.score - a.score)[0]
+  if (!best) return { sym, status: 'NO DATA', score: 0, updated: nowIso(), error: 'No valid latest price.', checks: [], setup: {}, price: null, next: 'No usable price.' }
+  return best
 }
-function loadState(){
-  try { return sanitizeState(JSON.parse(localStorage.getItem(STORAGE_KEY))) }
-  catch { return seedState() }
+function estimateLot(sym, accountSize, riskPct, entry, sl) {
+  const e = n(entry), s = n(sl), acct = n(accountSize) || 0, risk = n(riskPct) || 0
+  if (e === null || s === null || e === s) return null
+  const riskUsd = acct * risk / 100
+  const dist = Math.abs(e - s)
+  let oneLotPerPoint = 100000
+  if (sym === 'XAUUSD') oneLotPerPoint = 100
+  if (sym === 'USDJPY') oneLotPerPoint = 1000
+  const lot = riskUsd / (dist * oneLotPerPoint)
+  return { riskUsd, lot: Math.max(0, lot), stopDistance: dist }
+}
+function telegramText(analysis) {
+  const s = analysis.setup || {}
+  const checks = (analysis.checks || []).map(c => `${c.ok ? '✅' : '❌'} ${c.label}`).join('\n')
+  return `🚨 <b>${analysis.status} — ${analysis.sym} ${analysis.direction}</b>\n\nScore: ${analysis.score}/100\nPrice: ${fmt(analysis.price, analysis.sym)}\n\nEntry: ${fmt(s.entryLow, analysis.sym)} - ${fmt(s.entryHigh, analysis.sym)}\nSL: ${fmt(s.sl, analysis.sym)}\nTP1: ${fmt(s.tp1, analysis.sym)}\nTP2: ${fmt(s.tp2, analysis.sym)}\nTP3: ${fmt(s.tp3, analysis.sym)}\nRR: ${s.rr ? s.rr.toFixed(2) : '—'}R\n\n${checks}\n\nAction:\n${analysis.next}`
+}
+async function sendTelegram(settings, text) {
+  if (!settings.telegramBotToken || !settings.telegramChatId) throw new Error('Telegram token/chat ID missing')
+  const r = await fetch('/api/telegram', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ botToken: settings.telegramBotToken, chatId: settings.telegramChatId, text })
+  })
+  const j = await r.json().catch(() => ({}))
+  if (!r.ok || j.ok === false) throw new Error(j.error || j.description || 'Telegram failed')
+  return j
 }
 
-
-function setupFromZone(sym, zone, priceObj){
-  const price = livePrice(priceObj?.price, sym)
-  const z = zone || {}
-  const wl=n(z.watchLow), wh=n(z.watchHigh), el=n(z.entryLow), eh=n(z.entryHigh), inv=n(z.invalidation)
-  const tps=[n(z.tp1),n(z.tp2),n(z.tp3)]
-  const configured = hasZone(z)
-  if(!configured) return { status:'NO SETUP', reason:'No active watch zone configured.', next:'Set watch zone, entry zone and invalidation.', missing:'Watch zone', grade:'REJECT', distance:null }
-  if(price === null) return { status:'NO DATA', reason:'Waiting for live or manual price.', next:'Add manual price or connect Finnhub/Twelve Data.', missing:'Price feed', grade:'REJECT', distance:null }
-
-  let status = 'TOO FAR', reason = 'Price is outside all active zones.', next = 'Wait. No trade until price reaches the watch zone.', missing = 'Price near zone', grade='C'
-  const watchDistance = distanceToZone(price, z.watchLow, z.watchHigh)
-  const entryDistance = distanceToZone(price, z.entryLow, z.entryHigh)
-
-  if(wl !== null && wh !== null && price >= Math.min(wl,wh) && price <= Math.max(wl,wh)) {
-    status='WATCH'; reason='Price entered watch zone.'; next='Wait for confirmation. No market entry.'; missing=z.requiredConfirmation || 'confirmation'; grade='C'
+function Badge({ children, tone = 'neutral' }) { return <span className={`badge ${tone}`}>{children}</span> }
+function Button({ children, tone = 'primary', ...props }) { return <button className={`btn ${tone}`} {...props}>{children}</button> }
+function Card({ children, className = '' }) { return <section className={`card ${className}`}>{children}</section> }
+function Field({ label, children }) { return <label className="field"><span>{label}</span>{children}</label> }
+function Input(props) { return <input className="input" {...props} /> }
+function Select(props) { return <select className="input" {...props} /> }
+function Area(props) { return <textarea className="input area" {...props} /> }
+function CheckRow({ c }) { return <div className="check-row"><span className={c.ok ? 'ok' : 'no'}>{c.ok ? '✅' : '❌'}</span><div><b>{c.label}</b><small>{c.detail}</small></div></div> }
+function MiniChart({ candles = [], analysis }) {
+  const data = candles.slice(-80)
+  if (data.length < 2) return <div className="chart-empty">No chart data yet</div>
+  const w = 680, h = 220, pad = 20
+  const highs = data.map(c => c.high), lows = data.map(c => c.low)
+  const min = Math.min(...lows, analysis?.setup?.sl ?? Infinity, analysis?.setup?.entryLow ?? Infinity)
+  const max = Math.max(...highs, analysis?.setup?.tp1 ?? -Infinity, analysis?.setup?.entryHigh ?? -Infinity)
+  const x = i => pad + i * ((w - pad * 2) / (data.length - 1))
+  const y = v => h - pad - ((v - min) / (max - min || 1)) * (h - pad * 2)
+  const path = data.map((c, i) => `${i ? 'L' : 'M'} ${x(i)} ${y(c.close)}`).join(' ')
+  const lines = []
+  const addLine = (value, label, cls) => {
+    if (value === null || value === undefined || !Number.isFinite(Number(value))) return
+    lines.push(<g key={label}><line className={cls} x1={pad} x2={w-pad} y1={y(value)} y2={y(value)} /><text x={w-pad-5} y={y(value)-4} textAnchor="end" className="chart-label">{label}</text></g>)
   }
-  if(el !== null && eh !== null && price >= Math.min(el,eh) && price <= Math.max(el,eh)) {
-    status='READY'; reason='Price is inside entry zone.'; next='Run Decision Engine before execution.'; missing='Decision Engine confirmation'; grade = z.htfBias && z.htfBias !== 'neutral' ? 'A' : 'B'
-  }
-  if(inv !== null) {
-    if(z.direction === 'LONG' && price <= inv) { status='INVALIDATED'; reason='Price hit invalidation.'; next='No trade. Archive setup.'; missing='—'; grade='REJECT' }
-    if(z.direction === 'SHORT' && price >= inv) { status='INVALIDATED'; reason='Price hit invalidation.'; next='No trade. Archive setup.'; missing='—'; grade='REJECT' }
-  }
-  const tpIndex = tps.findIndex(tp => tp !== null && ((z.direction==='LONG' && price>=tp) || (z.direction==='SHORT' && price<=tp)))
-  if(tpIndex >= 0){ status='TARGET HIT'; reason=`TP${tpIndex+1} reached or passed.`; next='Manage position according to plan.'; missing='management'; grade='A' }
-  return { status, reason, next, missing, grade, distance: entryDistance ?? watchDistance }
-}
-function distanceToZone(price, low, high){ const p=n(price), l=n(low), h=n(high); if(p===null||l===null||h===null) return null; if(p>=Math.min(l,h)&&p<=Math.max(l,h)) return 0; return p<Math.min(l,h) ? Math.min(l,h)-p : p-Math.max(l,h) }
-function computeFloatingR(trade, price){
-  const p=livePrice(price, trade.market), e=n(trade.entry), sl=n(trade.sl); if(p===null||e===null||sl===null||e===sl) return null
-  const sign = directionSign(trade.direction); return ((p-e)*sign / Math.abs(e-sl))
-}
-function riskCalc({accountSize,riskPct,entry,sl,tp1,market}){
-  const specs = { XAUUSD:100, NQ:20, ES:50, EURUSD:100000, GBPUSD:100000, USDJPY:1000 }
-  const e=n(entry), s=n(sl), t=n(tp1), acct=n(accountSize)||0, rp=n(riskPct)||0
-  if(e===null||s===null||e===s) return { ok:false, dollars:0, size:0, rr:null, stop:0 }
-  const stop = Math.abs(e-s), dollars = acct*rp/100, perPoint = specs[market] || 100000
-  const size = dollars/(stop*perPoint)
-  const rr = t===null ? null : Math.abs(t-e)/stop
-  return { ok: rp <= 1 && (rr===null || rr>=3), dollars, size, rr, stop }
-}
-function governor(journal){
-  const today = journal.filter(j => j.taken && new Date(j.date).toDateString() === new Date().toDateString())
-  const losses = today.filter(j=>j.result==='loss').length
-  if(today.length >= 3) return { state:'LOCKED', msg:'Daily cap reached. Desk closed.', riskCap:0 }
-  if(losses >= 2) return { state:'DANGER', msg:'Two losses today. Protect capital, no dopamine hunting.', riskCap:0.25 }
-  return { state:'OPEN', msg:`Desk open. ${today.length}/3 trades today, ${losses} losses.`, riskCap:1 }
-}
-function learning(journal){
-  const counts={}; journal.forEach(j=>{ if(j.mistake && j.mistake !== 'None') counts[j.mistake]=(counts[j.mistake]||0)+1 })
-  return Object.entries(counts).sort((a,b)=>b[1]-a[1]).map(([k,c])=>({ label:k, count:c, tier:c>=20?'rule candidate':c>=10?'strong hypothesis':c>=5?'hypothesis':c>=3?'pattern':'observation' }))
-}
-function providerForSymbol(provider, sym, settings){
-  if (provider === 'auto') {
-    return ['XAUUSD','EURUSD','GBPUSD','USDJPY'].includes(sym) ? 'twelve' : 'finnhub'
-  }
-  return provider
-}
-async function fetchPrice(provider, sym, settings){
-  const def = MARKET_DEFS[sym]
-  const actual = providerForSymbol(provider, sym, settings)
-  if(actual === 'finnhub' && settings.finnhubKey){
-    const url = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(def.finnhub)}&token=${encodeURIComponent(settings.finnhubKey)}`
-    const r = await fetch(url); const j = await r.json();
-    const px = livePrice(j.c, sym)
-    if(px !== null) return { price:px, source:sym==='NQ'?'Finnhub QQQ proxy':sym==='ES'?'Finnhub SPY proxy':'Finnhub', status:'live', updated:new Date().toISOString(), error:'' }
-    throw new Error(j.error || `Finnhub returned invalid ${sym} price`)
-  }
-  if(actual === 'twelve' && settings.twelveKey){
-    const url = `https://api.twelvedata.com/price?symbol=${encodeURIComponent(def.twelve)}&apikey=${encodeURIComponent(settings.twelveKey)}`
-    const r = await fetch(url); const j = await r.json();
-    const px = livePrice(j.price, sym)
-    if(px !== null) return { price:px, source:'Twelve Data', status:'live', updated:new Date().toISOString(), error:'' }
-    throw new Error(j.message || j.code || `Twelve Data returned invalid ${sym} price`)
-  }
-  throw new Error(actual === 'manual' ? 'Manual mode active' : `Missing ${actual} API key`)
+  addLine(analysis?.setup?.entryLow, 'entry low', 'entry-line')
+  addLine(analysis?.setup?.entryHigh, 'entry high', 'entry-line')
+  addLine(analysis?.setup?.sl, 'SL', 'sl-line')
+  addLine(analysis?.setup?.tp1, 'TP1', 'tp-line')
+  return <svg className="mini-chart" viewBox={`0 0 ${w} ${h}`} role="img"><path d={path} className="price-path" />{lines}</svg>
 }
 
-function analyzePlannedSetup(setup, priceObj){
-  const price = livePrice(priceObj?.price, setup.market)
-  const e1 = n(setup.entry), e2 = n(setup.entryHigh || setup.entry), sl = n(setup.sl), tp1 = n(setup.tp1)
-  if (setup.status === 'SKIPPED' || setup.status === 'CLOSED') return { status:setup.status, reason:'Setup archived.', action:'No action.', distance:null }
-  if (setup.taken) return { status:'TAKEN', reason:'Trade was marked as placed in MT5.', action:'Manage under Active Trades.', distance:null }
-  if (price === null) return { status:'NO DATA', reason:'No usable live/manual price for this market.', action:'Set manual price or fix data provider.', distance:null }
-  if (e1 === null || sl === null) return { status:'WAITING', reason:'Entry or SL is missing.', action:'Complete the trade plan before action.', distance:null }
-  const lo = Math.min(e1, e2 ?? e1), hi = Math.max(e1, e2 ?? e1)
-  const sign = directionSign(setup.direction)
-  if (sl !== null && ((setup.direction==='LONG' && price <= sl) || (setup.direction==='SHORT' && price >= sl))) return { status:'INVALIDATED', reason:'Price hit the invalidation / SL level before entry.', action:'Do not take. Archive or rebuild plan.', distance:0 }
-  if (tp1 !== null && ((setup.direction==='LONG' && price >= tp1) || (setup.direction==='SHORT' && price <= tp1))) return { status:'TARGET HIT', reason:'Price already reached TP1 before you marked it taken.', action:'Do not chase. Plan is late.', distance:0 }
-  if (price >= lo && price <= hi) return { status:'READY', reason:'Price is inside the entry zone.', action:'Open TradingView for final check, then place trade in MT5 if still valid.', distance:0 }
-  const dist = price < lo ? lo-price : price-hi
-  const stop = Math.abs((e1 || 0) - (sl || 0))
-  const near = stop ? dist <= stop * 1.5 : false
-  if (near) return { status:'WATCH', reason:'Price is approaching the entry zone.', action:'Get ready. No entry until price hits the zone and chart still confirms.', distance:dist }
-  return { status:'TOO FAR', reason:'Price is far from the entry zone.', action:'Do nothing. Let price come to your plan.', distance:dist }
-}
+export default function App() {
+  const [state, setState] = useState(loadState)
+  const [page, setPage] = useState('radar')
+  const [selected, setSelected] = useState(state.settings.focusMarket || 'XAUUSD')
+  const [busy, setBusy] = useState(false)
+  const [message, setMessage] = useState('')
+  const lastScanRef = useRef(null)
 
+  useEffect(() => { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)) }, [state])
+  const update = fn => setState(s => typeof fn === 'function' ? fn(clone(s)) : fn)
 
-function Badge({children, tone='neutral'}){ return <span className={`badge ${tone}`}>{children}</span> }
-function Button({children, tone='primary', ...props}){ return <button className={`btn ${tone}`} {...props}>{children}</button> }
-function Field({label, children}){ return <label className="field"><span>{label}</span>{children}</label> }
-function TextInput(props){ return <input className="input" {...props} /> }
-function Select(props){ return <select className="input" {...props} /> }
-function Area(props){ return <textarea className="input area" {...props} /> }
-function Card({children, className=''}){ return <section className={`card ${className}`}>{children}</section> }
+  const selectedAnalysis = state.analyses[selected]
+  const selectedCandles = state.candles[selected]?.['15min'] || []
+  const sortedAnalyses = useMemo(() => MARKET_LIST.map(sym => state.analyses[sym] || { sym, status: 'NO DATA', score: 0, next: 'Not scanned yet.', setup: {}, checks: [] }).sort((a, b) => b.score - a.score), [state.analyses])
+  const ready = sortedAnalyses.filter(a => a.status === 'READY')
+  const watch = sortedAnalyses.filter(a => ['WATCH', 'BOS CONFIRMED', 'FORMING'].includes(a.status))
 
-function App(){
-  const [state,setState] = useState(loadState)
-  const [page,setPage] = useState('radar')
-  const [selected,setSelected] = useState('XAUUSD')
-  const [manualPrice,setManualPrice] = useState('')
-  useEffect(()=>{ localStorage.setItem(STORAGE_KEY, JSON.stringify(state)) },[state])
-  const update = fn => setState(s => typeof fn === 'function' ? fn(structuredClone(s)) : fn)
-  const gov = useMemo(()=>governor(state.journal),[state.journal])
-  const liveStatuses = useMemo(()=>MARKET_LIST.reduce((acc,sym)=>{ acc[sym]=setupFromZone(sym,state.zones[sym],state.prices[sym]); return acc },{}),[state.zones,state.prices])
-  const activeTrades = state.trades.filter(t=>!['CLOSED','INVALIDATED'].includes(t.status))
-  const rankedMarkets = MARKET_LIST.map(sym=>{
-    const st = liveStatuses[sym]; const base = st.status==='READY'?92:st.status==='TARGET HIT'?88:st.status==='MANAGING'?84:st.status==='FORMING'?72:st.status==='WATCH'?64:st.status==='TOO FAR'?42:st.status==='NO DATA'?30:st.status==='INVALIDATED'?0:25
-    return { sym, ...st, score:base, price:state.prices[sym]?.price, priceObj:state.prices[sym] }
-  }).sort((a,b)=>b.score-a.score)
-  const primary = rankedMarkets.find(m=>['READY','TARGET HIT','MANAGING','WATCH','FORMING'].includes(m.status)) || rankedMarkets.find(m=>m.status==='NO DATA' && hasZone(state.zones[m.sym])) || rankedMarkets.find(m=>m.sym===state.daily.primary) || rankedMarkets[0]
-
-  async function refreshPrices(){
-    const provider = state.settings.dataProvider
-    if(provider === 'manual') return
-    for(const sym of MARKET_LIST){
-      try{ const p = await fetchPrice(provider, sym, state.settings); update(s=>{ s.prices[sym]=p; return s }) }
-      catch(e){ update(s=>{ s.prices[sym] = { price:null, source:provider, status:'error', updated:new Date().toISOString(), error:e.message }; return s }) }
+  async function handleAlerts(analysis) {
+    const s = state.settings
+    const wants = (analysis.status === 'READY' && s.alertReady) || (analysis.status === 'WATCH' && s.alertWatch) || (analysis.status === 'BOS CONFIRMED' && s.alertWatch) || (analysis.status === 'INVALIDATED' && s.alertInvalid)
+    if (!wants || !s.telegramBotToken || !s.telegramChatId) return
+    const key = `${analysis.sym}-${analysis.direction}-${analysis.status}-${Math.floor(Date.now() / 1000 / 60 / 30)}`
+    if (state.alertLog.some(a => a.key === key)) return
+    try {
+      await sendTelegram(s, telegramText(analysis))
+      update(d => { d.alertLog.unshift({ key, time: nowIso(), sym: analysis.sym, status: analysis.status, ok: true }); return d })
+    } catch (err) {
+      update(d => { d.alertLog.unshift({ key, time: nowIso(), sym: analysis.sym, status: analysis.status, ok: false, error: err.message }); return d })
     }
   }
-  useEffect(()=>{
-    if(state.settings.dataProvider === 'manual') return
-    refreshPrices()
-    const ms = clamp(Number(state.settings.pollSeconds)||60, 15, 300)*1000
-    const t = setInterval(refreshPrices, ms)
-    return ()=>clearInterval(t)
-  },[state.settings.dataProvider,state.settings.finnhubKey,state.settings.twelveKey,state.settings.pollSeconds])
 
-  function createSetup(sym){
-    const z = state.zones[sym]; const st = liveStatuses[sym];
-    const setup = { id:id('S'), market:sym, direction:z.direction, status:['NO SETUP','NO DATA','TOO FAR'].includes(st.status)?'WATCH':st.status, grade:st.grade, riskPct:st.grade==='A'?0.5:0.25, entry:z.entryLow || '', sl:z.invalidation || '', tp1:z.tp1||'', tp2:z.tp2||'', tp3:z.tp3||'', reason:st.reason, missing:st.missing, invalidation:z.invalidation?`${z.direction==='LONG'?'Below':'Above'} ${z.invalidation}`:'Not defined', nextAction:st.next, createdAt:new Date().toISOString(), taken:false }
-    update(s=>{ s.setups.unshift(setup); return s })
-    setPage('radar')
-  }
-  function saveManualSetup(plan){
-    const e1 = normalizePriceInput(plan.entry, plan.market)
-    const e2 = normalizePriceInput(plan.entryHigh || plan.entry, plan.market)
-    const sl = normalizePriceInput(plan.sl, plan.market)
-    const t1 = normalizePriceInput(plan.tp1, plan.market)
-    const setup = {
-      id:id('S'), market:plan.market, direction:plan.direction, status:'WAITING', grade:plan.grade || 'B',
-      riskPct:Number(plan.riskPct)||0.5, entry:(e1 ?? plan.entry), entryHigh:(e2 ?? plan.entryHigh ?? e1 ?? ''), sl:(sl ?? plan.sl),
-      tp1:(t1 ?? plan.tp1), tp2:(normalizePriceInput(plan.tp2, plan.market) ?? plan.tp2), tp3:(normalizePriceInput(plan.tp3, plan.market) ?? plan.tp3),
-      reason:plan.reason || 'Manual TradingView setup.', missing:plan.missing || 'Final TradingView confirmation',
-      invalidation:sl ? `${plan.direction==='LONG'?'Below':'Above'} ${sl}` : 'Not defined', nextAction:'Wait for price to enter the entry zone. Then final chart check and MT5 execution.',
-      checklist: plan.checklist || {}, createdAt:new Date().toISOString(), taken:false
+  async function scanMarket(sym = selected) {
+    if (!state.settings.twelveKey) { setMessage('Add your Twelve Data API key in Settings first.'); return }
+    setBusy(true); setMessage(`Scanning ${sym} candle data...`)
+    try {
+      const bundles = {}
+      for (const interval of INTERVALS) {
+        const size = interval === '1day' ? 100 : 120
+        bundles[interval] = await fetchTwelveSeries(sym, interval, state.settings.twelveKey, size)
+      }
+      const analysis = analyzeMarket(sym, bundles)
+      update(d => {
+        d.candles[sym] = bundles
+        d.analyses[sym] = analysis
+        d.settings.focusMarket = sym
+        return d
+      })
+      lastScanRef.current = nowIso()
+      setMessage(`${sym} scanned: ${analysis.status} / score ${analysis.score}.`)
+      setSelected(sym)
+      setTimeout(() => handleAlerts(analysis), 0)
+    } catch (err) {
+      const analysis = { sym, status: 'NO DATA', score: 0, error: err.message, updated: nowIso(), next: 'Fix API key / rate limit / symbol access.', checks: [], setup: {} }
+      update(d => { d.analyses[sym] = analysis; return d })
+      setMessage(`${sym} scan failed: ${err.message}`)
+    } finally {
+      setBusy(false)
     }
-    update(s=>{
-      s.setups.unshift(setup)
-      s.zones[plan.market] = { ...s.zones[plan.market], direction:plan.direction, entryLow:String(setup.entry||''), entryHigh:String(setup.entryHigh||setup.entry||''), invalidation:String(setup.sl||''), tp1:String(setup.tp1||''), tp2:String(setup.tp2||''), tp3:String(setup.tp3||''), requiredConfirmation:setup.missing, setupType:setup.reason }
-      return s
+  }
+
+  useEffect(() => {
+    if (!state.settings.autoRefresh) return
+    const sec = Math.max(60, Number(state.settings.pollSeconds) || 60)
+    const id = setInterval(() => scanMarket(selected), sec * 1000)
+    return () => clearInterval(id)
+  }, [state.settings.autoRefresh, state.settings.pollSeconds, selected, state.settings.twelveKey])
+
+  function markTradeTaken(analysis) {
+    const est = estimateLot(analysis.sym, state.settings.accountSize, state.settings.riskPct, analysis.setup.entry, analysis.setup.sl)
+    update(d => {
+      d.activeTrades.unshift({
+        id: uid('T'),
+        date: nowIso(),
+        sym: analysis.sym,
+        direction: analysis.direction,
+        entry: analysis.setup.entry,
+        entryLow: analysis.setup.entryLow,
+        entryHigh: analysis.setup.entryHigh,
+        sl: analysis.setup.sl,
+        tp1: analysis.setup.tp1,
+        tp2: analysis.setup.tp2,
+        tp3: analysis.setup.tp3,
+        rr: analysis.setup.rr,
+        lotEstimate: est?.lot || null,
+        riskUsd: est?.riskUsd || null,
+        status: 'ACTIVE',
+        setupScore: analysis.score,
+        evidence: analysis.checks,
+      })
+      return d
     })
-    setSelected(plan.market)
-    setPage('action')
+    setMessage('Trade marked ACTIVE. Execute manually in MT5 and manage from Active Trades.')
   }
-  function archiveSetup(setupId, status='SKIPPED'){
-    update(s=>{ const x=s.setups.find(a=>a.id===setupId); if(x){x.status=status; x.skippedAt=new Date().toISOString()} return s })
+  function closeTrade(id, result, r) {
+    update(d => {
+      const idx = d.activeTrades.findIndex(t => t.id === id)
+      if (idx >= 0) {
+        const t = d.activeTrades[idx]
+        d.activeTrades.splice(idx, 1)
+        d.journal.unshift({ ...t, closed: nowIso(), result, r, lesson: '', mistake: result === 'loss' ? 'Review execution vs checklist' : 'Process followed' })
+      }
+      return d
+    })
   }
-  function markTaken(setup){
-    const trade = { id:id('T'), setupId:setup.id, market:setup.market, direction:setup.direction, status:'MANAGING', entry:setup.entry, sl:setup.sl, tp1:setup.tp1, tp2:setup.tp2, tp3:setup.tp3, riskPct:setup.riskPct, openedAt:new Date().toISOString(), closedAt:'', result:'open', r:0, notes:setup.reason }
-    update(s=>{ const x=s.setups.find(a=>a.id===setup.id); if(x){x.taken=true;x.status='TRIGGERED'} s.trades.unshift(trade); return s })
-  }
-  function closeTrade(trade, result){
-    const currentR = computeFloatingR(trade, state.prices[trade.market]?.price)
-    const finalR = currentR === null ? 0 : Number(currentR.toFixed(2))
-    update(s=>{ const t=s.trades.find(x=>x.id===trade.id); if(t){t.status='CLOSED';t.result=result;t.r=finalR;t.closedAt=new Date().toISOString()} s.journal.unshift({ id:id('J'), market:trade.market, date:new Date().toISOString(), session:'Manual', setupType:'Radar setup', decision:'TAKE', taken:true, result, r:finalR, classification: result==='loss'?'Variance':'Good skip', mistake:'None', emotion:'Calm', lesson: currentR === null ? 'Closed without live price feed; verify result manually.' : '' }); return s })
-  }
-  const pages = { radar:'Radar', action:'Action Desk', newsetup:'New Setup', scanner:'Scanner', live:'Live Watcher', decide:'Decide', risk:'Risk', trades:'Trades', journal:'Journal', learning:'Learning', daily:'Daily', weekly:'CEO Review', settings:'Settings' }
-  const render = {
-    radar:<Radar state={state} primary={primary} rankedMarkets={rankedMarkets} activeTrades={activeTrades} liveStatuses={liveStatuses} setPage={setPage} setSelected={setSelected} createSetup={createSetup} markTaken={markTaken} gov={gov} closeTrade={closeTrade}/>,
-    action:<ActionDesk state={state} markTaken={markTaken} closeTrade={closeTrade} archiveSetup={archiveSetup} setPage={setPage}/>,
-    newsetup:<NewSetup state={state} saveManualSetup={saveManualSetup} setPage={setPage}/>,
-    scanner:<Scanner state={state} update={update} rankedMarkets={rankedMarkets} liveStatuses={liveStatuses} refreshPrices={refreshPrices} setSelected={setSelected} setPage={setPage} manualPrice={manualPrice} setManualPrice={setManualPrice}/>,
-    live:<LiveWatcher state={state} rankedMarkets={rankedMarkets} refreshPrices={refreshPrices} setPage={setPage} setSelected={setSelected}/>,
-    decide:<Decide state={state} update={update} selected={selected} setSelected={setSelected} createSetup={createSetup}/>,
-    risk:<Risk state={state}/>,
-    trades:<Trades state={state} update={update} closeTrade={closeTrade}/>,
-    journal:<Journal state={state} update={update}/>,
-    learning:<Learning state={state}/>,
-    daily:<Daily state={state} update={update}/>,
-    weekly:<Weekly state={state}/>,
-    settings:<Settings state={state} update={update}/>,
-  }
+
+  const tabs = [
+    ['radar', 'Radar', Radar], ['scanner', 'Scanner', Crosshair], ['evidence', 'Evidence', Shield], ['setups', 'Setups', Target], ['active', 'Active', Activity], ['telegram', 'Telegram', Bell], ['settings', 'Settings', Settings],
+  ]
+
   return <div className="app">
-    <aside className="side"><Logo/><nav>{Object.entries(pages).map(([k,v])=><button key={k} className={page===k?'active':''} onClick={()=>setPage(k)}>{v}</button>)}</nav></aside>
-    <main className="main"><MobileTop page={pages[page]}/>{render[page]}</main>
-    <nav className="bottom">{['radar','action','newsetup','trades','settings'].map(k=><button key={k} className={page===k?'active':''} onClick={()=>setPage(k)}>{pages[k]}</button>)}</nav>
+    <header className="topbar">
+      <div><h1>Project Takeover V5</h1><p>Auto Setup Scanner — real-time candles → SMC checklist → setup alert → MT5 execution.</p></div>
+      <div className="top-actions"><Badge tone={classForStatus(selectedAnalysis?.status || 'NO DATA')}>{selectedAnalysis?.status || 'NO DATA'}</Badge><Button tone="ghost" onClick={() => scanMarket(selected)} disabled={busy}>{busy ? <RefreshCw className="spin" size={16}/> : <RefreshCw size={16}/>} Scan</Button></div>
+    </header>
+
+    <nav className="tabs">{tabs.map(([id, label, Icon]) => <button key={id} className={page === id ? 'active' : ''} onClick={() => setPage(id)}><Icon size={16}/>{label}</button>)}</nav>
+    {message && <div className="notice">{message}</div>}
+
+    {page === 'radar' && <main className="grid two">
+      <Card className="hero">
+        <div className="hero-head"><div><h2>Live Radar</h2><p>De app geeft alleen setups als de volledige checklist genoeg bewijs heeft. Geen data = geen signaal.</p></div><Badge tone="green">{ready.length} ready</Badge></div>
+        <div className="stats"><div><b>{ready.length}</b><span>READY</span></div><div><b>{watch.length}</b><span>FORMING / WATCH</span></div><div><b>{state.activeTrades.length}</b><span>ACTIVE</span></div><div><b>{lastScanRef.current ? new Date(lastScanRef.current).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) : '—'}</b><span>LAST SCAN</span></div></div>
+        <div className="market-list">
+          {sortedAnalyses.map(a => <button key={a.sym} className={`market-row ${selected === a.sym ? 'selected' : ''}`} onClick={() => { setSelected(a.sym); setPage('evidence') }}>
+            <div><b>{a.sym}</b><small>{MARKETS[a.sym]?.name}</small></div>
+            <div><Badge tone={classForStatus(a.status)}>{a.status}</Badge><span className="score">{a.score}/100</span></div>
+            <small>{a.next || a.error || 'Not scanned yet.'}</small>
+          </button>)}
+        </div>
+      </Card>
+      <Card>
+        <h2>Rules Engine</h2>
+        <div className="rules">{RULES.map((r, i) => <div key={i}><CheckCircle2 size={16}/><span>{r}</span></div>)}</div>
+        <div className="warning"><AlertTriangle size={18}/><span>Dit is een scanner en decision assistant, geen garantie op winst. Jij voert handmatig uit in MT5 na de alert.</span></div>
+      </Card>
+    </main>}
+
+    {page === 'scanner' && <main className="grid two">
+      <Card>
+        <h2>Auto Scanner</h2>
+        <p className="muted">Free Twelve Data heeft lage limieten. Scan daarom eerst één focus market per keer. XAUUSD is de primaire desk.</p>
+        <Field label="Focus market"><Select value={selected} onChange={e => setSelected(e.target.value)}>{MARKET_LIST.map(s => <option key={s}>{s}</option>)}</Select></Field>
+        <div className="button-row"><Button onClick={() => scanMarket(selected)} disabled={busy}><Play size={16}/> Scan {selected}</Button><Button tone="ghost" onClick={() => { const next = MARKET_LIST[(MARKET_LIST.indexOf(selected)+1)%MARKET_LIST.length]; setSelected(next); scanMarket(next) }} disabled={busy}>Scan next</Button></div>
+        <div className="scan-info"><b>Wat hij ophaalt:</b><span>D1 candles</span><span>4H candles</span><span>1H candles</span><span>15M candles</span></div>
+      </Card>
+      <Card>
+        <h2>{selected} mini chart</h2>
+        <MiniChart candles={selectedCandles} analysis={selectedAnalysis}/>
+        <p className="muted">Deze mini chart is alleen om zones/price visueel te zien. Diepe visuele analyse doe je nog steeds in TradingView.</p>
+      </Card>
+    </main>}
+
+    {page === 'evidence' && <main className="grid two">
+      <Card>
+        <div className="card-head"><div><h2>{selected} Evidence Board</h2><p>{MARKETS[selected]?.name} · {MARKETS[selected]?.symbol}</p></div><Badge tone={classForStatus(selectedAnalysis?.status || 'NO DATA')}>{selectedAnalysis?.status || 'NO DATA'}</Badge></div>
+        <div className="big-score"><b>{selectedAnalysis?.score ?? 0}</b><span>/100</span></div>
+        <p className="next-action"><b>Next:</b> {selectedAnalysis?.next || selectedAnalysis?.error || 'Scan market first.'}</p>
+        <div className="checks">{(selectedAnalysis?.checks || []).length ? selectedAnalysis.checks.map(c => <CheckRow key={c.key} c={c}/>) : <p className="muted">No evidence yet. Scan {selected} first.</p>}</div>
+      </Card>
+      <Card>
+        <h2>Detected Setup</h2>
+        {selectedAnalysis?.setup?.entry ? <SetupDetails analysis={selectedAnalysis} settings={state.settings} onTake={() => markTradeTaken(selectedAnalysis)} /> : <p className="muted">No setup zone detected yet.</p>}
+      </Card>
+    </main>}
+
+    {page === 'setups' && <main className="grid two">
+      {sortedAnalyses.map(a => <Card key={a.sym}>
+        <div className="card-head"><div><h2>{a.sym} {a.direction || ''}</h2><p>{a.next || a.error || 'Not scanned yet.'}</p></div><Badge tone={classForStatus(a.status)}>{a.status}</Badge></div>
+        <MiniChart candles={state.candles[a.sym]?.['15min'] || []} analysis={a}/>
+        {a.setup?.entry ? <SetupDetails analysis={a} settings={state.settings} onTake={() => markTradeTaken(a)} compact/> : <p className="muted">No automatic setup zone yet.</p>}
+      </Card>)}
+    </main>}
+
+    {page === 'active' && <main className="grid two">
+      <Card><h2>Active Trades</h2>{state.activeTrades.length === 0 && <p className="muted">No active trades yet.</p>}{state.activeTrades.map(t => <TradeCard key={t.id} t={t} analysis={state.analyses[t.sym]} onClose={closeTrade}/>)}</Card>
+      <Card><h2>Journal</h2>{state.journal.length === 0 && <p className="muted">Closed trades will appear here.</p>}{state.journal.slice(0,8).map(j => <div className="journal-row" key={j.id}><b>{j.sym} {j.direction}</b><span>{j.result} · {j.r}R</span><small>{new Date(j.closed).toLocaleString()}</small></div>)}</Card>
+    </main>}
+
+    {page === 'telegram' && <main className="grid two">
+      <Card><h2>Telegram Alerts</h2><p className="muted">Alerts sturen bij WATCH / READY / INVALIDATED. Token staat alleen in jouw browser localStorage en wordt gebruikt via de Vercel API route.</p>
+        <Field label="Bot token"><Input value={state.settings.telegramBotToken} onChange={e => update(d => { d.settings.telegramBotToken = e.target.value; return d })} placeholder="123456:ABC..."/></Field>
+        <Field label="Chat ID"><Input value={state.settings.telegramChatId} onChange={e => update(d => { d.settings.telegramChatId = e.target.value; return d })} placeholder="123456789"/></Field>
+        <div className="toggles"><label><input type="checkbox" checked={state.settings.alertWatch} onChange={e => update(d => { d.settings.alertWatch = e.target.checked; return d })}/> WATCH</label><label><input type="checkbox" checked={state.settings.alertReady} onChange={e => update(d => { d.settings.alertReady = e.target.checked; return d })}/> READY</label><label><input type="checkbox" checked={state.settings.alertInvalid} onChange={e => update(d => { d.settings.alertInvalid = e.target.checked; return d })}/> INVALID</label></div>
+        <Button onClick={async () => { try { await sendTelegram(state.settings, '✅ Project Takeover V5 test alert werkt.'); setMessage('Telegram test sent.') } catch(e) { setMessage(e.message) } }}>Send test alert</Button>
+      </Card>
+      <Card><h2>Alert Log</h2>{state.alertLog.length === 0 && <p className="muted">No alerts sent yet.</p>}{state.alertLog.slice(0,10).map(a => <div className="journal-row" key={a.key + a.time}><b>{a.sym} {a.status}</b><span>{a.ok ? 'sent' : 'failed'}</span><small>{a.error || new Date(a.time).toLocaleString()}</small></div>)}</Card>
+    </main>}
+
+    {page === 'settings' && <main className="grid two">
+      <Card><h2>Data Settings</h2>
+        <Field label="Twelve Data API key"><Input value={state.settings.twelveKey} onChange={e => update(d => { d.settings.twelveKey = e.target.value; return d })} placeholder="paste key"/></Field>
+        <Field label="Poll seconds"><Input type="number" min="60" value={state.settings.pollSeconds} onChange={e => update(d => { d.settings.pollSeconds = Number(e.target.value); return d })}/></Field>
+        <div className="toggles"><label><input type="checkbox" checked={state.settings.autoRefresh} onChange={e => update(d => { d.settings.autoRefresh = e.target.checked; return d })}/> Auto-refresh selected market</label></div>
+        <div className="warning"><AlertTriangle size={18}/><span>Gebruik 60s+ polling. Free plan rate-limit: scan niet alle markten tegelijk.</span></div>
+      </Card>
+      <Card><h2>Risk Settings</h2>
+        <Field label="Account size"><Input type="number" value={state.settings.accountSize} onChange={e => update(d => { d.settings.accountSize = Number(e.target.value); return d })}/></Field>
+        <Field label="Risk %"><Input type="number" step="0.1" max="1" value={state.settings.riskPct} onChange={e => update(d => { d.settings.riskPct = Number(e.target.value); return d })}/></Field>
+        <Button tone="danger" onClick={() => { if(confirm('Reset V5 local data?')) setState(clone(DEFAULT_STATE)) }}>Reset app data</Button>
+      </Card>
+    </main>}
   </div>
 }
-function Logo(){ return <div className="logo"><div className="logoMark">PT</div><div><b>PROJECT TAKEOVER</b><span>SETUP RADAR</span></div></div> }
-function MobileTop({page}){ return <div className="mobileTop"><Logo/><Badge tone="gold">{page}</Badge></div> }
-function Header({kicker,title,sub}){ return <header className="head"><p>{kicker}</p><h1>{title}</h1>{sub&&<span>{sub}</span>}</header> }
 
-function Radar({state, primary, rankedMarkets, activeTrades, liveStatuses, setPage, setSelected, createSetup, markTaken, gov, closeTrade}){
-  const setupsNow = state.setups.filter(s=>['READY','TRIGGERED','TARGET HIT'].includes(s.status) && !s.taken)
-  const setupsLater = state.setups.filter(s=>['WATCH','WATCHING','FORMING','TOO FAR'].includes(s.status) && !s.taken)
-  const invalidated = state.setups.filter(s=>s.status==='INVALIDATED' && !s.taken)
-  const readyCount = rankedMarkets.filter(m=>m.status==='READY').length
-  const watchCount = rankedMarkets.filter(m=>['WATCH','FORMING'].includes(m.status)).length
-  const invalidCount = rankedMarkets.filter(m=>m.status==='INVALIDATED').length
-  return <>
-    <Header kicker="Setup Radar" title="Today’s command" sub="Live prices create WATCH / READY / INVALID. The Decision Engine still decides TAKE / WAIT / SKIP."/>
-    <Card className="command">
-      <div><span className="muted">PRIMARY MARKET</span><h2>{primary.sym}</h2><p>{MARKET_DEFS[primary.sym].name} · price {fmt(livePrice(primary.price), primary.sym.includes('JPY')?3:2)} · updated {formatTime(primary.priceObj?.updated)}</p></div>
-      <div className="verdict"><Badge tone={statusTone(primary.status)}>{primary.status}</Badge><strong>{primary.grade}</strong></div>
-      <div className="reason"><b>{primary.reason}</b><span>{primary.next}</span></div>
-      <div className="actions"><Button onClick={()=>{setSelected(primary.sym); setPage('decide')}}>Run Decision</Button><Button tone="steel" onClick={()=>{setSelected(primary.sym); setPage('scanner')}}>Edit Zone</Button><Button tone="steel" onClick={()=>createSetup(primary.sym)}>Save Setup</Button></div>
-    </Card>
-    <div className="stats mini"><Card><span>READY NOW</span><b className="greenText">{readyCount}</b></Card><Card><span>WATCHING</span><b>{watchCount}</b></Card><Card><span>ACTIVE</span><b>{activeTrades.length}</b></Card><Card><span>INVALID</span><b className="redText">{invalidCount}</b></Card></div>
-    <div className={`banner ${gov.state.toLowerCase()}`}>{gov.state}: {gov.msg}</div>
-    <section className="split">
-      <div><h3>Ready now</h3>{setupsNow.length?setupsNow.map(s=><SetupCard key={s.id} setup={s} markTaken={markTaken}/>):<Empty text="No READY setups. Good. No forcing."/>}</div>
-      <div><h3>Setups later</h3>{setupsLater.length?setupsLater.map(s=><SetupCard key={s.id} setup={s} markTaken={markTaken}/>):<Empty text="No forming setups."/>}</div>
-    </section>
-    <section><h3>Active trades</h3>{activeTrades.length?activeTrades.map(t=><TradeMonitor key={t.id} trade={t} price={state.prices[t.market]?.price} closeTrade={closeTrade}/>):<Empty text="No active trades."/>}</section>
-    <section><h3>Invalidated</h3>{invalidated.length?invalidated.map(s=><SetupCard key={s.id} setup={s} markTaken={markTaken}/>):<Empty text="No invalidated saved setups."/>}</section>
-    <section><h3>Market ranking</h3><div className="rankGrid">{rankedMarkets.map(m=><button className="rank" key={m.sym} onClick={()=>{setSelected(m.sym);setPage('scanner')}}><span>{m.sym}</span><Badge tone={statusTone(m.status)}>{m.status}</Badge><b>{m.grade}</b><small>{m.reason}</small><small>Distance: {m.distance === null || m.distance === undefined ? '—' : fmt(m.distance, m.sym==='USDJPY'?3:2)}</small></button>)}</div></section>
-  </>
+function SetupDetails({ analysis, settings, onTake, compact = false }) {
+  const s = analysis.setup || {}
+  const est = estimateLot(analysis.sym, settings.accountSize, settings.riskPct, s.entry, s.sl)
+  const canTake = analysis.status === 'READY'
+  return <div className="setup-details">
+    <div className="levels">
+      <div><span>Entry zone</span><b>{fmt(s.entryLow, analysis.sym)} - {fmt(s.entryHigh, analysis.sym)}</b></div>
+      <div><span>SL</span><b>{fmt(s.sl, analysis.sym)}</b></div>
+      <div><span>TP1</span><b>{fmt(s.tp1, analysis.sym)}</b></div>
+      <div><span>TP2</span><b>{fmt(s.tp2, analysis.sym)}</b></div>
+      {!compact && <div><span>TP3</span><b>{fmt(s.tp3, analysis.sym)}</b></div>}
+      <div><span>RR</span><b>{s.rr ? s.rr.toFixed(2) : '—'}R</b></div>
+      <div><span>Lot estimate</span><b>{est ? est.lot.toFixed(3) : '—'}</b></div>
+      <div><span>Risk</span><b>${est ? est.riskUsd.toFixed(0) : '—'}</b></div>
+    </div>
+    <p className="muted">Source: {s.source || '—'}</p>
+    <Button tone={canTake ? 'primary' : 'ghost'} disabled={!canTake} onClick={onTake}>{canTake ? 'Trade placed in MT5' : 'No execution yet'}</Button>
+  </div>
 }
-function SetupCard({setup, markTaken}){ return <Card className="setup"><div className="setupTop"><b>{setup.market} {setup.direction}</b><Badge tone={statusTone(setup.status)}>{setup.status}</Badge></div><h4>{setup.grade} · risk {setup.riskPct}%</h4><p>{setup.reason}</p><dl><dt>Entry</dt><dd>{setup.entry||'—'}</dd><dt>SL</dt><dd>{setup.sl||'—'}</dd><dt>TP</dt><dd>{[setup.tp1,setup.tp2,setup.tp3].filter(Boolean).join(' / ')||'—'}</dd></dl><p className="muted">Missing: {setup.missing}</p><p className="muted">Invalidation: {setup.invalidation}</p>{!setup.taken && setup.status !== 'INVALIDATED' && <Button tone="green" onClick={()=>markTaken(setup)}>Mark taken</Button>}</Card> }
-function TradeMonitor({trade, price, closeTrade}){
-  const live = livePrice(price)
-  const r=computeFloatingR(trade, live)
-  const tpDist = live === null || n(trade.tp1) === null ? null : Math.abs(n(trade.tp1)-live)
-  const slDist = live === null || n(trade.sl) === null ? null : Math.abs(live-n(trade.sl))
-  return <Card className="trade"><div><b>{trade.market} {trade.direction}</b><span>{live===null?'Waiting for price feed':`Live ${fmt(live)}`}</span></div><strong className={r===null?'':r>=0?'greenText':'redText'}>{r===null?'NO PRICE':`${r.toFixed(2)}R`}</strong><p>Entry {trade.entry} · SL {trade.sl} · TP1 {trade.tp1}</p><p className="muted">Distance to SL: {slDist===null?'—':fmt(slDist)} · Distance to TP1: {tpDist===null?'—':fmt(tpDist)}</p><div className="row"><Button tone="steel" onClick={()=>closeTrade(trade,'win')}>Close win</Button><Button tone="red" onClick={()=>closeTrade(trade,'loss')}>Close loss</Button></div></Card>
+function TradeCard({ t, analysis, onClose }) {
+  const price = analysis?.price
+  const r = price && t.entry && t.sl ? ((t.direction === 'LONG' ? price - t.entry : t.entry - price) / Math.abs(t.entry - t.sl)) : null
+  return <div className="trade-card">
+    <div className="card-head"><div><b>{t.sym} {t.direction}</b><small>{t.id}</small></div><Badge tone="amber">ACTIVE</Badge></div>
+    <div className="levels"><div><span>Entry</span><b>{fmt(t.entry, t.sym)}</b></div><div><span>SL</span><b>{fmt(t.sl, t.sym)}</b></div><div><span>TP1</span><b>{fmt(t.tp1, t.sym)}</b></div><div><span>Floating</span><b>{r === null ? '—' : `${r.toFixed(2)}R`}</b></div></div>
+    <div className="button-row"><Button tone="ghost" onClick={() => onClose(t.id, 'win', 2)}>Close win</Button><Button tone="danger" onClick={() => onClose(t.id, 'loss', -1)}>Close loss</Button><Button tone="ghost" onClick={() => onClose(t.id, 'breakeven', 0)}>BE</Button></div>
+  </div>
 }
-function Empty({text}){ return <Card className="empty">{text}</Card> }
-
-function LiveWatcher({state, rankedMarkets, refreshPrices, setPage, setSelected}){
-  return <><Header kicker="Live Watcher" title="Price feed + distance map" sub="This is the live market layer. If no API key is connected, use manual price in Scanner."/>
-    <Card><div className="row"><Button onClick={refreshPrices}>Refresh prices</Button><Button tone="steel" onClick={()=>setPage('settings')}>Provider settings</Button></div><p className="muted">Provider: {state.settings.dataProvider}. Poll: {state.settings.pollSeconds}s. API keys stored locally are not secret.</p></Card>
-    <div className="rankGrid liveGrid">{rankedMarkets.map(m=>{ const z=state.zones[m.sym], p=state.prices[m.sym]; const lp=livePrice(p.price); const dw=distanceToZone(lp,z.watchLow,z.watchHigh); const de=distanceToZone(lp,z.entryLow,z.entryHigh); return <button key={m.sym} className="rank" onClick={()=>{setSelected(m.sym);setPage('scanner')}}><span>{m.sym}</span><Badge tone={statusTone(m.status)}>{m.status}</Badge><b>{fmt(livePrice(p.price), m.sym==='USDJPY'?3:2)}</b><small>{MARKET_DEFS[m.sym].name} · {p.source} · {p.status}</small><small>Updated: {formatTime(p.updated)}</small><small>Watch distance: {dw===null?'—':fmt(dw, m.sym==='USDJPY'?3:2)}</small><small>Entry distance: {de===null?'—':fmt(de, m.sym==='USDJPY'?3:2)}</small>{p.error && <small className="redText">{p.error}</small>}</button> })}</div>
-  </>
-}
-
-function Scanner({state, update, rankedMarkets, liveStatuses, refreshPrices, setSelected, setPage, manualPrice, setManualPrice}){
-  return <><Header kicker="Live Pair Scanner" title="Live scanner + watch zones" sub="Free APIs are optional. Manual mode always works."/><Card><div className="row"><Button onClick={refreshPrices}>Refresh live prices</Button><Button tone="steel" onClick={()=>setPage('settings')}>Data settings</Button></div></Card><div className="scanList">{MARKET_LIST.map(sym=><MarketRow key={sym} sym={sym} state={state} update={update} status={liveStatuses[sym]} setSelected={setSelected} setPage={setPage} manualPrice={manualPrice} setManualPrice={setManualPrice}/>)}</div></>
-}
-function MarketRow({sym,state,update,status,setSelected,setPage,manualPrice,setManualPrice}){
-  const p=state.prices[sym], z=state.zones[sym]
-  function updZone(k,v){ update(s=>{ s.zones[sym][k]=v; return s }) }
-  function setPrice(){ const val=livePrice(manualPrice, sym); if(val!==null) update(s=>{ s.prices[sym]={price:val,source:'manual',status:'manual',updated:new Date().toISOString(),error:''}; return s }) }
-  return <Card className="marketRow"><div className="marketHead"><div><h3>{sym}</h3><p>{MARKET_DEFS[sym].name} · {MARKET_DEFS[sym].proxy}</p></div><div><Badge tone={statusTone(status.status)}>{status.status}</Badge><strong>{displayPrice(sym, p.price)}</strong></div></div><p>{status.reason} <span className="muted">Next: {status.next}</span></p><div className="zoneGrid"><Field label="Watch low"><TextInput value={z.watchLow} onChange={e=>updZone('watchLow',e.target.value)}/></Field><Field label="Watch high"><TextInput value={z.watchHigh} onChange={e=>updZone('watchHigh',e.target.value)}/></Field><Field label="Entry low"><TextInput value={z.entryLow} onChange={e=>updZone('entryLow',e.target.value)}/></Field><Field label="Entry high"><TextInput value={z.entryHigh} onChange={e=>updZone('entryHigh',e.target.value)}/></Field><Field label="Invalidation"><TextInput value={z.invalidation} onChange={e=>updZone('invalidation',e.target.value)}/></Field><Field label="TP1"><TextInput value={z.tp1} onChange={e=>updZone('tp1',e.target.value)}/></Field></div><div className="row"><Select value={z.direction} onChange={e=>updZone('direction',e.target.value)}><option>LONG</option><option>SHORT</option></Select><Select value={z.htfBias} onChange={e=>updZone('htfBias',e.target.value)}><option>bullish</option><option>neutral</option><option>bearish</option></Select><Button tone="steel" onClick={()=>{setSelected(sym);setPage('decide')}}>Decide</Button></div><div className="row"><TextInput placeholder="manual price" value={manualPrice} onChange={e=>setManualPrice(e.target.value)}/><Button tone="steel" onClick={setPrice}>Set price</Button></div><small className="muted">Source {p.source} · {p.status} · updated {formatTime(p.updated)} · {p.error}</small></Card>
-}
-function Decide({state,update,selected,setSelected,createSetup}){
-  const [checks,setChecks]=useState({regime:false,macro:false,liquidity:false,structure:false,displacement:false,route:false,execution:false,rr:false,psych:true,news:true})
-  const score = Object.entries(checks).reduce((a,[k,v])=>a+(v?(k==='psych'||k==='news'?8:12):0),0)
-  const decision = !checks.psych || !checks.news ? 'SKIP' : score>=84 ? 'TAKE TRADE' : score>=56 ? 'WAIT' : 'SKIP'
-  const risk = decision==='TAKE TRADE' ? (score>=96?1:0.5) : decision==='WAIT'?0.25:0
-  const z=state.zones[selected]
-  const screens=state.screens[selected]||[]
-  function updScreen(i,k,v){ update(s=>{ s.screens[selected][i][k]=v; return s }) }
-  return <><Header kicker="Decision Engine" title="Validate the setup" sub="Live price can prepare a setup. Only this gate can approve a trade."/><div className="selector">{MARKET_LIST.map(s=><button className={s===selected?'active':''} onClick={()=>setSelected(s)} key={s}>{s}</button>)}</div><Card className={`decision ${decision.includes('TAKE')?'take':decision==='WAIT'?'wait':'skip'}`}><span>FINAL DECISION</span><h2>{decision}</h2><p>{decision.includes('TAKE')?'Place limit order only. No chase.':decision==='WAIT'?'Wait for missing confirmation. Set alert.':'No trade. Protect capital.'}</p><div className="row"><Badge tone={decision.includes('TAKE')?'green':decision==='WAIT'?'amber':'red'}>{score}/100</Badge><Badge tone="gold">Risk {risk}%</Badge></div><p><b>Invalidation:</b> {z.invalidation || 'not defined'}</p><p><b>Next:</b> {decision.includes('TAKE')?'Verify chart and calculate risk.': 'Wait for 1H displacement + 15M retest.'}</p></Card><section className="split"><Card><h3>Confluence gates</h3>{Object.keys(checks).map(k=><label className="check" key={k}><input type="checkbox" checked={checks[k]} onChange={e=>setChecks({...checks,[k]:e.target.checked})}/><span>{k}</span></label>)}<Button onClick={()=>createSetup(selected)}>Create setup dossier</Button></Card><Card><h3>Screenshot workflow</h3>{screens.map((x,i)=><div className="tf" key={x.tf}><label><input type="checkbox" checked={x.checked} onChange={e=>updScreen(i,'checked',e.target.checked)}/><b>{x.tf}</b><span>{x.role}</span>{x.requiredNext&&<Badge tone="amber">required next</Badge>}</label><TextInput placeholder="notes" value={x.notes} onChange={e=>updScreen(i,'notes',e.target.value)}/></div>)}</Card></section></>
-}
-
-function ActionDesk({state, markTaken, closeTrade, archiveSetup, setPage}){
-  const planned = state.setups.filter(s=>!s.taken && !['CLOSED'].includes(s.status)).map(s=>({ setup:s, evidence:analyzePlannedSetup(s, state.prices[s.market]) }))
-  const ready = planned.filter(x=>x.evidence.status==='READY')
-  const watch = planned.filter(x=>['WATCH','WAITING','TOO FAR','NO DATA'].includes(x.evidence.status))
-  const invalid = planned.filter(x=>['INVALIDATED','TARGET HIT','SKIPPED'].includes(x.evidence.status) || x.setup.status==='SKIPPED')
-  const active = state.trades.filter(t=>!['CLOSED','INVALIDATED'].includes(t.status))
-  return <>
-    <Header kicker="Manual Trading Desk" title="Action Desk" sub="TradingView is your analysis. This screen turns your plan into action: wait, get ready, place in MT5, manage, journal."/>
-    <Card className="command actionHero"><div><span className="muted">NEXT ACTION</span><h2>{ready[0]?.setup.market || watch[0]?.setup.market || 'No setup'}</h2><p>{ready[0] ? ready[0].evidence.action : watch[0] ? watch[0].evidence.action : 'Create a setup from your TradingView analysis.'}</p></div><div className="verdict"><Badge tone={ready.length?'green':'neutral'}>{ready.length ? 'READY' : 'WAIT'}</Badge><strong>{ready.length}</strong></div><div className="actions"><Button onClick={()=>setPage('newsetup')}>New setup</Button><Button tone="steel" onClick={()=>setPage('live')}>Check prices</Button></div></Card>
-    <div className="stats mini"><Card><span>READY</span><b className="greenText">{ready.length}</b></Card><Card><span>WATCH</span><b>{watch.length}</b></Card><Card><span>ACTIVE</span><b>{active.length}</b></Card><Card><span>INVALID/LATE</span><b className="redText">{invalid.length}</b></Card></div>
-    <section><h3>Ready to act</h3>{ready.length?ready.map(x=><ActionSetupCard key={x.setup.id} setup={x.setup} evidence={x.evidence} markTaken={markTaken} archiveSetup={archiveSetup} accountSize={state.settings.accountSize}/>):<Empty text="No READY setups. Do not force action."/>}</section>
-    <section><h3>Watching / waiting</h3>{watch.length?watch.map(x=><ActionSetupCard key={x.setup.id} setup={x.setup} evidence={x.evidence} markTaken={markTaken} archiveSetup={archiveSetup} accountSize={state.settings.accountSize}/>):<Empty text="No planned setups. Create one from TradingView."/>}</section>
-    <section><h3>Active MT5 trades</h3>{active.length?active.map(t=><TradeMonitor key={t.id} trade={t} price={state.prices[t.market]?.price} closeTrade={closeTrade}/>):<Empty text="No active trades marked in the app."/>}</section>
-    <section><h3>Invalid / late / skipped</h3>{invalid.length?invalid.map(x=><ActionSetupCard key={x.setup.id} setup={x.setup} evidence={x.evidence} markTaken={markTaken} archiveSetup={archiveSetup} accountSize={state.settings.accountSize}/>):<Empty text="Nothing invalidated."/>}</section>
-  </>
-}
-function ActionSetupCard({setup,evidence,markTaken,archiveSetup,accountSize}){
-  const rc = riskCalc({accountSize, market:setup.market, entry:setup.entry, sl:setup.sl, tp1:setup.tp1, riskPct:setup.riskPct})
-  return <Card className="setup actionCard"><div className="setupTop"><b>{setup.market} {setup.direction}</b><Badge tone={statusTone(evidence.status)}>{evidence.status}</Badge></div><h4>{setup.grade || 'B'} · {setup.riskPct}% risk</h4><p><b>{evidence.reason}</b></p><p className="muted">Action: {evidence.action}</p><dl><dt>Entry</dt><dd>{setup.entryHigh && String(setup.entryHigh)!==String(setup.entry)?`${setup.entry} - ${setup.entryHigh}`:setup.entry||'—'}</dd><dt>SL</dt><dd>{setup.sl||'—'}</dd><dt>TP</dt><dd>{[setup.tp1,setup.tp2,setup.tp3].filter(Boolean).join(' / ')||'—'}</dd><dt>Lot est.</dt><dd>{rc.size ? fmt(rc.size,4) : '—'} · RR {rc.rr?`1:${rc.rr.toFixed(2)}`:'—'}</dd></dl><div className="checklistMini"><span>{setup.checklist?.htf?'✅':'⬜'} HTF</span><span>{setup.checklist?.liquidity?'✅':'⬜'} Liquidity</span><span>{setup.checklist?.bos?'✅':'⬜'} BOS</span><span>{setup.checklist?.risk?'✅':'⬜'} Risk</span></div><p className="muted">Reason: {setup.reason}</p><div className="row">{evidence.status==='READY' && <Button tone="green" onClick={()=>markTaken(setup)}>Trade placed in MT5</Button>}<Button tone="steel" onClick={()=>archiveSetup(setup.id,'SKIPPED')}>Skip / archive</Button></div></Card>
-}
-function NewSetup({state, saveManualSetup, setPage}){
-  const [plan,setPlan]=useState({market:'XAUUSD',direction:'LONG',entry:'',entryHigh:'',sl:'',tp1:'',tp2:'',tp3:'',riskPct:0.5,grade:'B',reason:'',missing:'Final TradingView confirmation',checklist:{htf:false,liquidity:false,bos:false,risk:true}})
-  const set=(k,v)=>setPlan(p=>({...p,[k]:v}))
-  const setCheck=(k,v)=>setPlan(p=>({...p,checklist:{...p.checklist,[k]:v}}))
-  const rc = riskCalc({accountSize:state.settings.accountSize, market:plan.market, entry:normalizePriceInput(plan.entry, plan.market), sl:normalizePriceInput(plan.sl, plan.market), tp1:normalizePriceInput(plan.tp1, plan.market), riskPct:plan.riskPct})
-  const ready = normalizePriceInput(plan.entry, plan.market)!==null && normalizePriceInput(plan.sl, plan.market)!==null && normalizePriceInput(plan.tp1, plan.market)!==null && Number(plan.riskPct) <= Number(state.settings.maxRiskPct || 1)
-  return <>
-    <Header kicker="TradingView → Action" title="Create manual setup" sub="Use this after your morning/evening TradingView analysis. The app then watches price and tells you when to act."/>
-    <Card><div className="zoneGrid"><Field label="Market"><Select value={plan.market} onChange={e=>set('market',e.target.value)}>{MARKET_LIST.map(m=><option key={m}>{m}</option>)}</Select></Field><Field label="Direction"><Select value={plan.direction} onChange={e=>set('direction',e.target.value)}><option>LONG</option><option>SHORT</option></Select></Field><Field label="Entry from"><TextInput placeholder="2328.50" value={plan.entry} onChange={e=>set('entry',e.target.value)}/></Field><Field label="Entry to"><TextInput placeholder="2330.00" value={plan.entryHigh} onChange={e=>set('entryHigh',e.target.value)}/></Field><Field label="Stop loss"><TextInput value={plan.sl} onChange={e=>set('sl',e.target.value)}/></Field><Field label="TP1"><TextInput value={plan.tp1} onChange={e=>set('tp1',e.target.value)}/></Field><Field label="TP2"><TextInput value={plan.tp2} onChange={e=>set('tp2',e.target.value)}/></Field><Field label="TP3"><TextInput value={plan.tp3} onChange={e=>set('tp3',e.target.value)}/></Field><Field label="Risk %"><TextInput value={plan.riskPct} onChange={e=>set('riskPct',e.target.value)}/></Field><Field label="Grade"><Select value={plan.grade} onChange={e=>set('grade',e.target.value)}>{GRADES.filter(g=>g!=='REJECT').map(g=><option key={g}>{g}</option>)}</Select></Field></div><Field label="Why this setup?"><Area value={plan.reason} onChange={e=>set('reason',e.target.value)} placeholder="Example: 4H demand + liquidity sweep + 1H displacement expected."/></Field><Field label="What must still be true before taking it?"><Area value={plan.missing} onChange={e=>set('missing',e.target.value)}/></Field><div className="checklistMini big"><label><input type="checkbox" checked={plan.checklist.htf} onChange={e=>setCheck('htf',e.target.checked)}/> HTF bias clear</label><label><input type="checkbox" checked={plan.checklist.liquidity} onChange={e=>setCheck('liquidity',e.target.checked)}/> Liquidity story</label><label><input type="checkbox" checked={plan.checklist.bos} onChange={e=>setCheck('bos',e.target.checked)}/> BOS/displacement</label><label><input type="checkbox" checked={plan.checklist.risk} onChange={e=>setCheck('risk',e.target.checked)}/> Risk allowed</label></div><div className="stats mini"><Card><span>Risk $</span><b>${fmt(rc.dollars)}</b></Card><Card><span>Lot estimate</span><b>{fmt(rc.size,4)}</b></Card><Card><span>RR</span><b>{rc.rr?`1:${rc.rr.toFixed(2)}`:'—'}</b></Card><Card><span>Status</span><b className={ready?'greenText':'redText'}>{ready?'READY TO SAVE':'MISSING LEVELS'}</b></Card></div><div className="row"><Button disabled={!ready} onClick={()=>saveManualSetup(plan)}>Save setup to Action Desk</Button><Button tone="steel" onClick={()=>setPage('action')}>Back to Action Desk</Button></div></Card>
-  </>
-}
-function Risk({state}){ const [form,setForm]=useState({market:'XAUUSD',entry:'2328.50',sl:'2321.80',tp1:'2340',riskPct:1}); const r=riskCalc({accountSize:state.settings.accountSize,...form}); const set=(k,v)=>setForm({...form,[k]:v}); return <><Header kicker="Risk Calculator" title="Size before execution" sub="Max 1%. Estimates only — verify inside broker."/><Card><div className="zoneGrid"><Field label="Market"><Select value={form.market} onChange={e=>set('market',e.target.value)}>{MARKET_LIST.map(m=><option key={m}>{m}</option>)}</Select></Field><Field label="Risk %"><TextInput value={form.riskPct} onChange={e=>set('riskPct',e.target.value)}/></Field><Field label="Entry"><TextInput value={form.entry} onChange={e=>set('entry',e.target.value)}/></Field><Field label="SL"><TextInput value={form.sl} onChange={e=>set('sl',e.target.value)}/></Field><Field label="TP1"><TextInput value={form.tp1} onChange={e=>set('tp1',e.target.value)}/></Field></div></Card><div className="stats"><Card><span>Dollar risk</span><b>${fmt(r.dollars)}</b></Card><Card><span>Position estimate</span><b>{fmt(r.size,4)}</b></Card><Card><span>RR to TP1</span><b>{r.rr?`1:${r.rr.toFixed(2)}`:'—'}</b></Card><Card><span>Status</span><b className={r.ok?'greenText':'redText'}>{r.ok?'APPROVED':'REJECTED'}</b></Card></div></> }
-function Trades({state,closeTrade}){ return <><Header kicker="Trades" title="Active trade monitor" sub="Track floating R and manage according to plan."/>{state.trades.length?state.trades.map(t=><TradeMonitor key={t.id} trade={t} price={state.prices[t.market]?.price} closeTrade={closeTrade}/>):<Empty text="No trades."/>}</> }
-function Journal({state,update}){ const [form,setForm]=useState({market:'XAUUSD',date:new Date().toISOString(),session:'London',setupType:'',decision:'WAIT',taken:false,result:'skipped',r:0,classification:'Variance',mistake:'None',emotion:'Calm',lesson:''}); function add(){ update(s=>{ s.journal.unshift({...form,id:id('J')}); return s }) } return <><Header kicker="Journal" title="Every setup is a dossier" sub="Classify losses correctly: variance is not a mistake."/><Card><div className="zoneGrid"><Field label="Market"><Select value={form.market} onChange={e=>setForm({...form,market:e.target.value})}>{MARKET_LIST.map(m=><option key={m}>{m}</option>)}</Select></Field><Field label="Session"><Select value={form.session} onChange={e=>setForm({...form,session:e.target.value})}>{SESSIONS.map(s=><option key={s}>{s}</option>)}</Select></Field><Field label="Classification"><Select value={form.classification} onChange={e=>setForm({...form,classification:e.target.value})}>{MISTAKES.slice(1,7).map(m=><option key={m}>{m}</option>)}</Select></Field><Field label="Mistake"><Select value={form.mistake} onChange={e=>setForm({...form,mistake:e.target.value})}>{MISTAKES.map(m=><option key={m}>{m}</option>)}</Select></Field><Field label="R result"><TextInput value={form.r} onChange={e=>setForm({...form,r:e.target.value})}/></Field></div><Field label="Lesson"><Area value={form.lesson} onChange={e=>setForm({...form,lesson:e.target.value})}/></Field><Button onClick={add}>Add journal item</Button></Card><div>{state.journal.map(j=><Card key={j.id} className="journal"><b>{j.market}</b><Badge tone={j.result==='win'?'green':j.result==='loss'?'red':'neutral'}>{j.result}</Badge><p>{j.classification} · {j.mistake} · {j.r}R</p><small>{j.lesson}</small></Card>)}</div></> }
-function Learning({state}){ const l=learning(state.journal); return <><Header kicker="Self-Learning" title="Evidence, not panic" sub="The strategy changes only when repeated data demands it."/><div className="banner open">1 = observation · 3 = pattern · 5 = hypothesis · 10 = strong · 20 = rule candidate</div>{l.map(x=><Card key={x.label} className="learn"><b>{x.label}</b><Badge tone={x.count>=5?'amber':'neutral'}>{x.tier}</Badge><p>{x.count} recurring examples</p></Card>)}</> }
-function Daily({state,update}){ const d=state.daily; const set=(k,v)=>update(s=>{ s.daily[k]=v; return s }); return <><Header kicker="Daily Flow" title="Run the day like a desk" sub="Morning scan → active watch → decision → evening review."/><Card><div className="zoneGrid"><Field label="Primary market"><Select value={d.primary} onChange={e=>set('primary',e.target.value)}>{MARKET_LIST.map(m=><option key={m}>{m}</option>)}</Select></Field><Field label="Secondary"><Select value={d.secondary} onChange={e=>set('secondary',e.target.value)}>{MARKET_LIST.map(m=><option key={m}>{m}</option>)}</Select></Field><Field label="Mental state"><TextInput value={d.mental} onChange={e=>set('mental',e.target.value)}/></Field><Field label="Max trades"><TextInput value={d.maxTrades} onChange={e=>set('maxTrades',e.target.value)}/></Field></div><Field label="Today’s command"><Area value={d.command} onChange={e=>set('command',e.target.value)}/></Field><Field label="High-impact news"><Area value={d.news} onChange={e=>set('news',e.target.value)}/></Field></Card></> }
-function Weekly({state}){ const j=state.journal; const taken=j.filter(x=>x.taken); const wins=taken.filter(x=>x.result==='win').length; const losses=taken.filter(x=>x.result==='loss').length; const net=taken.reduce((a,x)=>a+(Number(x.r)||0),0); const learn=learning(j)[0]; return <><Header kicker="Weekly CEO Review" title="Prop-desk performance review" sub="What improved expectancy, what destroyed it, and what changes next week."/><div className="stats"><Card><span>Trades</span><b>{taken.length}</b></Card><Card><span>Winrate</span><b>{wins+losses?Math.round(wins/(wins+losses)*100):0}%</b></Card><Card><span>Net R</span><b className={net>=0?'greenText':'redText'}>{net.toFixed(1)}R</b></Card><Card><span>Repeated pattern</span><b>{learn?.label || 'none'}</b></Card></div><Card><h3>Next week focus</h3><p>{learn ? `Reduce: ${learn.label}. Proposed test: no A rating unless this failure mode is explicitly blocked.` : 'Keep collecting clean data.'}</p></Card></> }
-function Settings({state,update}){ const set=(k,v)=>update(s=>{ s.settings[k]=v; return s }); function exportJson(){ const blob=new Blob([JSON.stringify(state,null,2)],{type:'application/json'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='project-takeover-backup.json'; a.click() } return <><Header kicker="Settings" title="Your desk" sub="API keys in localStorage are not secret. Move to serverless functions later."/><Card><div className="zoneGrid"><Field label="Trader"><TextInput value={state.settings.trader} onChange={e=>set('trader',e.target.value)}/></Field><Field label="Account size"><TextInput value={state.settings.accountSize} onChange={e=>set('accountSize',e.target.value)}/></Field><Field label="Max risk"><TextInput value={state.settings.maxRiskPct} onChange={e=>set('maxRiskPct',e.target.value)}/></Field><Field label="Data provider"><Select value={state.settings.dataProvider} onChange={e=>set('dataProvider',e.target.value)}><option value="manual">Manual</option><option value="auto">Auto router</option><option value="finnhub">Finnhub</option><option value="twelve">Twelve Data</option></Select></Field><Field label="Finnhub API key"><TextInput value={state.settings.finnhubKey} onChange={e=>set('finnhubKey',e.target.value)}/></Field><Field label="Twelve Data API key"><TextInput value={state.settings.twelveKey} onChange={e=>set('twelveKey',e.target.value)}/></Field><Field label="Poll seconds"><TextInput value={state.settings.pollSeconds} onChange={e=>set('pollSeconds',e.target.value)}/></Field><Field label="Economic Calendar URL"><TextInput value={state.settings.economicCalendarUrl} onChange={e=>set('economicCalendarUrl',e.target.value)}/></Field></div><Button onClick={exportJson}>Export backup</Button></Card></> }
-
-export default App
