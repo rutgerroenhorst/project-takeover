@@ -1,0 +1,186 @@
+//@version=5
+// =====================================================================
+// PROJECT TAKEOVER — SMC Scanner v1  (TradingView Pine Script)
+//
+// A FIRST PRACTICAL version of the setup logic. It detects:
+//   swing highs/lows, liquidity sweeps, BOS / CHoCH, displacement,
+//   basic FVG, and a retest into the entry zone. It scores 0–100 and
+//   moves through: NO_SETUP -> FORMING -> WATCH -> BOS_CONFIRMED ->
+//   READY, or INVALIDATED.
+//
+// It fires alert() with a JSON payload for the Project Takeover webhook.
+// This is a decision-support scanner — NOT financial advice, NOT a
+// guarantee of profit, and it does NOT execute trades.
+// =====================================================================
+indicator("Project Takeover — SMC Scanner v1", overlay=true, max_labels_count=200)
+
+// ---------------- Inputs ----------------
+secret   = input.string("USER_CONFIGURED_SECRET", "Webhook secret")
+swingLen = input.int(5,   "Swing pivot lookback", minval=2)
+atrLen   = input.int(14,  "ATR length",           minval=1)
+dispMult = input.float(1.5,"Displacement: body ≥ ATR ×", step=0.1)
+slPad    = input.float(0.5,"SL padding (ATR ×)",   step=0.1)
+rr1f     = input.float(1.5,"TP1 (R multiple)",     step=0.1)
+rr2f     = input.float(3.0,"TP2 (R multiple)",     step=0.1)
+rr3f     = input.float(5.0,"TP3 (R multiple)",     step=0.1)
+
+// ---------------- Building blocks ----------------
+atr = ta.atr(atrLen)
+
+ph = ta.pivothigh(high, swingLen, swingLen)
+pl = ta.pivotlow(low,  swingLen, swingLen)
+
+var float swingHigh = na
+var float swingLow  = na
+if not na(ph)
+    swingHigh := ph
+if not na(pl)
+    swingLow := pl
+
+// Displacement candle
+body     = math.abs(close - open)
+disp     = body >= atr * dispMult
+dispBull = disp and close > open
+dispBear = disp and close < open
+
+// Liquidity sweep (take the level, close back through it)
+sweepBull = not na(swingLow)  and low  < swingLow  and close > swingLow
+sweepBear = not na(swingHigh) and high > swingHigh and close < swingHigh
+
+// Break of structure
+bosBull = not na(swingHigh) and close > swingHigh
+bosBear = not na(swingLow)  and close < swingLow
+
+// Basic 3-candle Fair Value Gap
+fvgBull     = low  > high[2]
+fvgBear     = high < low[2]
+fvgBullLow  = high[2]
+fvgBullHigh = low
+fvgBearHigh = low[2]
+fvgBearLow  = high
+
+// ---------------- State machine ----------------
+var string dir        = na          // "LONG" / "SHORT"
+var string status     = "NO_SETUP"
+var float  eLow       = na
+var float  eHigh      = na
+var float  slv        = na
+var float  t1         = na
+var float  t2         = na
+var float  t3         = na
+var int    score      = 0
+var string reasonsCsv = ""
+
+prevStatus = status
+
+// --- Start a new setup only when idle/invalidated ---
+canStart = na(dir) or status == "NO_SETUP" or status == "INVALIDATED"
+if canStart and sweepBull
+    dir := "LONG", status := "FORMING", score := 25, reasonsCsv := "liquidity sweep"
+    eLow := na, eHigh := na, slv := na, t1 := na, t2 := na, t3 := na
+if canStart and sweepBear and dir != "LONG"
+    dir := "SHORT", status := "FORMING", score := 25, reasonsCsv := "liquidity sweep"
+    eLow := na, eHigh := na, slv := na, t1 := na, t2 := na, t3 := na
+
+// --- Progress LONG ---
+if dir == "LONG"
+    if status == "FORMING" and dispBull
+        status := "WATCH"
+        score := math.max(score, 45)
+        reasonsCsv := reasonsCsv + "|displacement"
+    if bosBull and (status == "FORMING" or status == "WATCH")
+        status := "BOS_CONFIRMED"
+        score := math.max(score, 75)
+        reasonsCsv := reasonsCsv + "|BOS confirmed"
+        eLow  := fvgBull ? fvgBullLow  : nz(swingLow, close - atr)
+        eHigh := fvgBull ? fvgBullHigh : close
+        if fvgBull
+            reasonsCsv := reasonsCsv + "|FVG"
+            score := math.min(100, score + 10)
+        slv := (na(swingLow) ? low : math.min(low, swingLow)) - atr * slPad
+        risk = math.max(eHigh - slv, atr * 0.1)
+        t1 := eHigh + risk * rr1f
+        t2 := eHigh + risk * rr2f
+        t3 := eHigh + risk * rr3f
+    if status == "BOS_CONFIRMED" and not na(eHigh) and low <= eHigh
+        status := "READY"
+        score := math.min(100, score + 10)
+        reasonsCsv := reasonsCsv + "|retest"
+    if not na(slv) and close < slv
+        status := "INVALIDATED"
+
+// --- Progress SHORT ---
+if dir == "SHORT"
+    if status == "FORMING" and dispBear
+        status := "WATCH"
+        score := math.max(score, 45)
+        reasonsCsv := reasonsCsv + "|displacement"
+    if bosBear and (status == "FORMING" or status == "WATCH")
+        status := "BOS_CONFIRMED"
+        score := math.max(score, 75)
+        reasonsCsv := reasonsCsv + "|BOS confirmed"
+        eHigh := fvgBear ? fvgBearHigh : nz(swingHigh, close + atr)
+        eLow  := fvgBear ? fvgBearLow  : close
+        if fvgBear
+            reasonsCsv := reasonsCsv + "|FVG"
+            score := math.min(100, score + 10)
+        slv := (na(swingHigh) ? high : math.max(high, swingHigh)) + atr * slPad
+        risk = math.max(slv - eLow, atr * 0.1)
+        t1 := eLow - risk * rr1f
+        t2 := eLow - risk * rr2f
+        t3 := eLow - risk * rr3f
+    if status == "BOS_CONFIRMED" and not na(eLow) and high >= eLow
+        status := "READY"
+        score := math.min(100, score + 10)
+        reasonsCsv := reasonsCsv + "|retest"
+    if not na(slv) and close > slv
+        status := "INVALIDATED"
+
+// ---------------- Build JSON payload ----------------
+f_reasonsJson(csv) =>
+    out = ""
+    if csv != ""
+        parts = str.split(csv, "|")
+        for i = 0 to array.size(parts) - 1
+            q = "\"" + array.get(parts, i) + "\""
+            out := out == "" ? q : out + "," + q
+    out
+
+dirOut      = na(dir) ? "" : dir
+reasonsJson = f_reasonsJson(reasonsCsv)
+
+payload = "{\"secret\":\"" + secret +
+   "\",\"symbol\":\"" + syminfo.ticker +
+   "\",\"timeframe\":\"" + timeframe.period +
+   "\",\"status\":\"" + status +
+   "\",\"direction\":\"" + dirOut +
+   "\",\"score\":" + str.tostring(score) +
+   ",\"entry_low\":" + str.tostring(nz(eLow, 0)) +
+   ",\"entry_high\":" + str.tostring(nz(eHigh, 0)) +
+   ",\"sl\":" + str.tostring(nz(slv, 0)) +
+   ",\"tp1\":" + str.tostring(nz(t1, 0)) +
+   ",\"tp2\":" + str.tostring(nz(t2, 0)) +
+   ",\"tp3\":" + str.tostring(nz(t3, 0)) +
+   ",\"reason\":[" + reasonsJson + "]" +
+   ",\"timestamp\":\"" + str.tostring(time) + "\"}"
+
+// ---------------- Fire alerts on meaningful status changes ----------------
+statusChanged = status != prevStatus
+notify = status == "WATCH" or status == "BOS_CONFIRMED" or status == "READY" or status == "INVALIDATED"
+if barstate.isconfirmed and statusChanged and notify
+    alert(payload, alert.freq_once_per_bar_close)
+
+// Simple static fallback (TradingView expands {{...}} for alertcondition only).
+// The alert() above is preferred because it carries live values.
+readyEvent = barstate.isconfirmed and statusChanged and status == "READY"
+alertcondition(readyEvent, "PT READY (static)", '{"secret":"USER_CONFIGURED_SECRET","symbol":"{{ticker}}","timeframe":"{{interval}}","status":"READY","direction":"LONG","score":91,"entry_low":0,"entry_high":0,"sl":0,"tp1":0,"tp2":0,"tp3":0,"reason":["liquidity sweep","BOS confirmed","retest"],"timestamp":"{{time}}"}')
+
+// ---------------- Minimal visuals ----------------
+plot(swingHigh, "Swing High", color=color.new(color.red, 55))
+plot(swingLow,  "Swing Low",  color=color.new(color.green, 55))
+
+col = status == "READY" ? color.new(color.green, 0) : status == "WATCH" or status == "BOS_CONFIRMED" ? color.new(color.orange, 0) : status == "INVALIDATED" ? color.new(color.red, 0) : color.new(color.gray, 0)
+var label lb = na
+if barstate.islast
+    label.delete(lb)
+    lb := label.new(bar_index, high, status + (na(dir) ? "" : " " + dir) + "  " + str.tostring(score) + "/100", style=label.style_label_down, color=col, textcolor=color.white, size=size.small)

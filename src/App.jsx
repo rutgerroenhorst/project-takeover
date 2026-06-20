@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Activity, AlertTriangle, Bell, CheckCircle2, Crosshair, Play, Radar, RefreshCw, Settings, Shield, Target, XCircle } from 'lucide-react'
+import SignalsInbox from './SignalsInbox.jsx'
 
 const STORAGE_KEY = 'project_takeover_v5_auto_setup_scanner'
 
@@ -472,7 +473,7 @@ export default function App() {
   }
 
   const tabs = [
-    ['radar', 'Radar', Radar], ['scanner', 'Scanner', Crosshair], ['evidence', 'Evidence', Shield], ['setups', 'Setups', Target], ['active', 'Active', Activity], ['telegram', 'Telegram', Bell], ['settings', 'Settings', Settings],
+    ['radar', 'Radar', Radar], ['scanner', 'Scanner', Crosshair], ['evidence', 'Evidence', Shield], ['setups', 'Setups', Target], ['active', 'Active', Activity], ['signals', 'Signals', Bell], ['telegram', 'Telegram', Bell], ['settings', 'Settings', Settings],
   ]
 
   return <div className="app">
@@ -542,6 +543,10 @@ export default function App() {
     {page === 'active' && <main className="grid two">
       <Card><h2>Active Trades</h2>{state.activeTrades.length === 0 && <p className="muted">No active trades yet.</p>}{state.activeTrades.map(t => <TradeCard key={t.id} t={t} analysis={state.analyses[t.sym]} onClose={closeTrade}/>)}</Card>
       <Card><h2>Journal</h2>{state.journal.length === 0 && <p className="muted">Closed trades will appear here.</p>}{state.journal.slice(0,8).map(j => <div className="journal-row" key={j.id}><b>{j.sym} {j.direction}</b><span>{j.result} · {j.r}R</span><small>{new Date(j.closed).toLocaleString()}</small></div>)}</Card>
+    </main>}
+
+    {page === 'signals' && <main className="grid two">
+      <SignalsInbox />
     </main>}
 
     {page === 'telegram' && <main className="grid two">
